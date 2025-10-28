@@ -4,6 +4,9 @@ This repository contains various Python scripts and SQL queries for healthcare/w
 
 ## **Script Summary**
 
+## **CONFIG**
+- **'config.py'** - Handles environment variables, database connection settings, API keys, and other configuration parameters required by the scripts for secure and consistent execution.
+
 ### **DWH Maintenance Scripts**
 - **`Historic_batch_script.py`** - Runs AWS Glue jobs to process historical member-level events data in batches with retry logic and concurrent execution management
 - **`solera_correction_manager.py`** - Sends correction events to Solera API to erase/correct data for specific time periods, with batch processing and error handling
