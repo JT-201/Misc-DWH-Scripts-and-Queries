@@ -8,7 +8,7 @@ conn = mysql.connector.connect(
 
 cursor = conn.cursor()
 
-csv_path = '/Users/joshuatolentino/Documents/Misc_Scripts/weights_filtered_20251022_102649.csv'
+csv_path = '/Users/joshuatolentino/Downloads/filtered_20251222_110911.csv'
 
 query = f"""
 LOAD DATA LOCAL INFILE '{csv_path}'
