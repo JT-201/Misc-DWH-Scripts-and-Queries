@@ -38,83 +38,104 @@ def create_amazon_user_tables(cursor, end_date='2025-12-31'):
     execute_with_timing(cursor, "CREATE INDEX idx_tmp_amazon_users_all_user_id ON tmp_amazon_users_all(user_id)", "Index Amazon users table")
 
 def create_amazon_users_6month_retention_table(cursor, end_date='2025-12-31'):
-    """Create temporary table for 6-month retention users using consecutive engagement logic"""
-    print(f"\n🏥 Creating Amazon 6-month retention users table...")
+    """Create temporary table for 6-month retention users (for health metrics only)"""
+    print(f"\n🏥 Creating Amazon 6-month retention users table (for health metrics only)...")
     
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_amazon_users_6month", "Drop 6-month retention users table")
     
+    # Step 1: Get base Amazon users
+    execute_with_timing(cursor, f"""
+        CREATE TEMPORARY TABLE tmp_amazon_users_base_6month AS
+        SELECT DISTINCT s.user_id, s.start_date
+        FROM subscriptions s
+        JOIN partner_employers pe ON pe.user_id = s.user_id
+        WHERE pe.name = 'Amazon'
+        AND s.status = 'ACTIVE'
+    """, f"Create base Amazon users for 6-month retention")
+    
+    # Step 2: Apply 6-month retention logic (from Apple script)
     execute_with_timing(cursor, f"""
         CREATE TEMPORARY TABLE tmp_amazon_users_6month AS
-        WITH amazon_base_users AS (
-            SELECT DISTINCT s.user_id, s.start_date
-            FROM subscriptions s
-            JOIN partner_employers pe ON pe.user_id = s.user_id
-            WHERE pe.name = 'Amazon'
-            AND s.status = 'ACTIVE'
-            AND (s.cancellation_date IS NULL OR s.cancellation_date < s.start_date)
-            AND s.start_date <= '{end_date}'
-        ),
-        user_monthly_engagement AS (
+        WITH user_subscription_days AS (
             SELECT 
-                abu.user_id,
-                abu.start_date,
-                DATE_FORMAT(bus.date, '%Y-%m') as engagement_month
-            FROM amazon_base_users abu
-            JOIN billable_user_statuses bus ON abu.user_id = bus.user_id
-            WHERE bus.is_billable = 1
-            AND bus.date <= '{end_date}'
-            GROUP BY abu.user_id, abu.start_date, DATE_FORMAT(bus.date, '%Y-%m')
+                au.user_id, 
+                au.start_date,
+                SUM(CASE WHEN bus.subscription_status = 'ACTIVE' THEN 1 ELSE 0 END) as days_with_active_subscription
+            FROM tmp_amazon_users_base_6month au
+            JOIN billable_user_statuses bus ON au.user_id = bus.user_id
+            WHERE bus.partner = 'Universal'
+            GROUP BY au.user_id, au.start_date
         ),
-        ordered_engagement AS (
+        six_months_retention_users AS (
             SELECT 
-                user_id,
-                start_date,
-                engagement_month,
-                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY engagement_month) as month_rank
-            FROM user_monthly_engagement
+                us.user_id, 
+                us.start_date,
+                us.days_with_active_subscription
+            FROM user_subscription_days us
+            WHERE us.days_with_active_subscription >= 180
+            AND EXISTS (SELECT 1 FROM billable_activities ba WHERE ba.user_id = us.user_id)
         ),
-        consecutive_periods AS (
+        user_activity_summary AS (
             SELECT 
-                user_id,
-                start_date,
-                engagement_month,
-                month_rank,
-                -- Create groups of consecutive months by subtracting the rank from the period
-                DATE_SUB(STR_TO_DATE(CONCAT(engagement_month, '-01'), '%Y-%m-%d'), 
-                         INTERVAL (month_rank - 1) MONTH) as period_group
-            FROM ordered_engagement
+                smru.user_id,
+                smru.start_date,
+                smru.days_with_active_subscription,
+                COUNT(DISTINCT DATE_FORMAT(ba.activity_timestamp, '%Y-%m')) as months_with_activity,
+                MIN(DATE(ba.activity_timestamp)) as first_activity_date,
+                MAX(DATE(ba.activity_timestamp)) as last_activity_date,
+                DATEDIFF(MAX(DATE(ba.activity_timestamp)), MIN(DATE(ba.activity_timestamp))) as activity_span_days
+            FROM six_months_retention_users smru
+            JOIN billable_activities ba ON smru.user_id = ba.user_id
+            WHERE ba.activity_timestamp IS NOT NULL
+            GROUP BY smru.user_id, smru.start_date, smru.days_with_active_subscription
         ),
-        consecutive_counts AS (
+        user_monthly_activity_check AS (
             SELECT 
                 user_id,
                 start_date,
-                period_group,
-                COUNT(*) as consecutive_months
-            FROM consecutive_periods
-            GROUP BY user_id, start_date, period_group
+                days_with_active_subscription,
+                months_with_activity,
+                first_activity_date,
+                last_activity_date
+            FROM user_activity_summary
+            WHERE activity_span_days > 150  -- At least ~5 months span
+            AND months_with_activity >= 6    -- Must have activity in at least 6 different months
         )
-        SELECT DISTINCT
+        SELECT 
             user_id,
-            start_date
-        FROM consecutive_counts
-        WHERE consecutive_months >= 6  -- Has at least one period of 6+ consecutive months
+            start_date,
+            days_with_active_subscription,
+            months_with_activity,
+            first_activity_date,
+            last_activity_date
+        FROM user_monthly_activity_check
     """, f"Create Amazon 6-month retention users table")
+    
+    # Clean up intermediate table
+    execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_amazon_users_base_6month", "Drop base 6-month users table")
     
     execute_with_timing(cursor, "CREATE INDEX idx_amazon_users_6month_user_id ON tmp_amazon_users_6month(user_id)", "Index 6-month retention users table")
     
-    # Print retention statistics
-    cursor.execute("SELECT COUNT(*) FROM tmp_amazon_users_all")
-    all_count = cursor.fetchone()[0]
+    # Print retention statistics comparison
+    print(f"  📊 Calculating user statistics...")
     
-    cursor.execute("SELECT COUNT(*) FROM tmp_amazon_users_6month")
-    retained_count = cursor.fetchone()[0]
+    # Get all users count
+    cursor.execute("SELECT COUNT(*) as all_users FROM tmp_amazon_users_all")
+    all_count = cursor.fetchone()[0]  # Access first element of tuple
+    
+    # Get 6-month retention users count
+    cursor.execute("SELECT COUNT(*) as retained_users FROM tmp_amazon_users_6month")
+    retained_count = cursor.fetchone()[0]  # Access first element of tuple
     
     print(f"  📊 All Amazon users: {all_count}")
     print(f"  📊 6-month retention users: {retained_count}")
     
+    # Avoid division by zero
     if all_count > 0:
         retention_rate = (retained_count / all_count * 100)
         print(f"  📊 Retention rate: {retention_rate:.1f}%")
+    else:
+        print(f"  📊 Retention rate: 0.0%")
 
 def create_amazon_glp1_tables(cursor, end_date='2025-12-31', coverage_gap_days=1):
     """Create GLP1 user tables for Amazon users"""
@@ -143,7 +164,7 @@ def create_amazon_glp1_tables(cursor, end_date='2025-12-31', coverage_gap_days=1
                 user_id,
                 MIN(prescribed_at) as first_prescription_date,
                 MAX(prescription_end_date) as last_prescription_end_date,
-                SUM(total_prescription_days) as total_covered_days,  -- FIXED: Changed from total_covered_days to total_prescription_days
+                SUM(total_prescription_days) as total_covered_days,
                 DATEDIFF(MAX(prescription_end_date), MIN(prescribed_at)) as total_period_days,
                 CASE 
                     WHEN DATEDIFF(MAX(prescription_end_date), MIN(prescribed_at)) > 0 
@@ -162,15 +183,15 @@ def create_amazon_glp1_tables(cursor, end_date='2025-12-31', coverage_gap_days=1
             total_period_days,
             gap_percentage
         FROM user_prescription_coverage
-        WHERE gap_percentage <= 10.0  -- More lenient than cohort script's 5%
+        WHERE gap_percentage <= 20.0  -- More lenient than cohort script's 5%
         AND total_covered_days >= 90   -- 90 days vs 60 days in cohort script
-        # AND DATE_ADD(last_prescription_end_date, INTERVAL {coverage_gap_days} DAY) >= DATE_SUB('{end_date}', INTERVAL 90 DAY)  -- Coverage extends to end_date ± gap
+        AND DATE_ADD(last_prescription_end_date, INTERVAL {coverage_gap_days} DAY) >= DATE_SUB('{end_date}', INTERVAL 90 DAY)  -- Coverage extends to end_date ± gap
     """, f"Create Amazon GLP1 users table (coverage through {end_date} ± {coverage_gap_days} days)")
     
     execute_with_timing(cursor, "CREATE INDEX idx_amazon_glp1_all_user_id ON tmp_amazon_glp1_users_all(user_id)", "Index Amazon GLP1 table")
 
 def create_weight_metrics_tables(cursor, end_date='2025-12-31'):
-    """Create weight metrics tables for Amazon users using 6-month retention users"""
+    """Create weight metrics tables for Amazon users using 6-month retention users for health metrics"""
     print(f"\n⚖️ Creating weight metrics tables (6-month retention users for health metrics)...")
     
     # Use 6-month retention users for health metrics
@@ -186,7 +207,7 @@ def create_weight_metrics_tables(cursor, end_date='2025-12-31'):
                 bwv.value * 2.20462 as weight_lbs,
                 bwv.effective_date,
                 ROW_NUMBER() OVER (PARTITION BY bwv.user_id ORDER BY bwv.effective_date ASC) as rn
-            FROM body_weight_values_cleaned bwv
+            FROM body_weight_values bwv
             JOIN {user_table} au ON bwv.user_id = au.user_id
             WHERE bwv.value IS NOT NULL
               AND bwv.effective_date >= DATE_SUB(au.start_date, INTERVAL 30 DAY)
@@ -196,7 +217,7 @@ def create_weight_metrics_tables(cursor, end_date='2025-12-31'):
         FROM ranked_weights WHERE rn = 1
     """, "Create baseline weight table")
 
-    # Latest weights from body_weight_values_cleaned
+    # Latest weights from body_weight_values
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_latest_weight_all", "Drop latest weight table")
     execute_with_timing(cursor, f"""
         CREATE TEMPORARY TABLE tmp_latest_weight_all AS
@@ -208,9 +229,11 @@ def create_weight_metrics_tables(cursor, end_date='2025-12-31'):
                 ROW_NUMBER() OVER (PARTITION BY bwv.user_id ORDER BY bwv.effective_date DESC) as rn
             FROM body_weight_values_cleaned bwv
             JOIN {user_table} au ON bwv.user_id = au.user_id
+            JOIN tmp_baseline_weight_all bbw ON bwv.user_id = bbw.user_id
             WHERE bwv.value IS NOT NULL
               AND bwv.effective_date >= au.start_date
               AND bwv.effective_date <= '{end_date}'
+              AND bwv.effective_date >= DATE_ADD(bbw.baseline_weight_date, INTERVAL 30 DAY)
         )
         SELECT user_id, weight_lbs as latest_weight_lbs, effective_date as latest_weight_date
         FROM ranked_weights WHERE rn = 1
@@ -474,22 +497,26 @@ def create_weight_loss_analysis(cursor):
         )
     """, "Create weight loss analysis table structure")
     
-    # Define user groups - FIXED to use health outcomes summary table
+    # Define all user groups to analyze (FIXED JOINS)
     user_groups = [
-        ('All Users', 'WHERE 1=1'),  # FIXED: Added WHERE 1=1 instead of empty string
-        ('Corporate', "JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
-        ('Ops', "JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
-        ('GLP1 Users', 'WHERE hos.is_glp1_user = 1'),
-        ('Corporate GLP1 Users', """JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id 
-                                   WHERE hos.is_glp1_user = 1 AND amm.job_category = 'Corporate'"""),
-        ('Ops GLP1 Users', """JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id 
-                              WHERE hos.is_glp1_user = 1 AND amm.job_category = 'Ops'"""),
-        ('No GLP1 Users', 'WHERE hos.is_glp1_user = 0 AND hos.weight_loss_pct <= 21'),
-        ('Corporate No GLP1 Users', """JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id 
-                                      WHERE hos.is_glp1_user = 0 AND hos.weight_loss_pct <= 21 
+        ('All Users', ''),
+        ('Corporate', "JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
+        ('Ops', "JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
+        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON bw.user_id = glp.user_id'),
+        ('Corporate GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON bw.user_id = glp.user_id 
+                                   JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id 
+                                   WHERE amm.job_category = 'Corporate'"""),
+        ('Ops GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON bw.user_id = glp.user_id 
+                              JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id 
+                              WHERE amm.job_category = 'Ops'"""),
+        ('No GLP1 Users', 'JOIN tmp_amazon_no_glp1_users_all noglp ON bw.user_id = noglp.user_id WHERE (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs <= 0.21'),
+        ('Corporate No GLP1 Users', """JOIN tmp_amazon_no_glp1_users_all noglp ON bw.user_id = noglp.user_id 
+                                      JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id 
+                                      WHERE (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs <= 0.21 
                                       AND amm.job_category = 'Corporate'"""),
-        ('Ops No GLP1 Users', """JOIN tmp_amazon_members_mapping amm ON hos.user_id = amm.user_id 
-                                 WHERE hos.is_glp1_user = 0 AND hos.weight_loss_pct <= 21 
+        ('Ops No GLP1 Users', """JOIN tmp_amazon_no_glp1_users_all noglp ON bw.user_id = noglp.user_id 
+                                 JOIN tmp_amazon_members_mapping amm ON bw.user_id = amm.user_id 
+                                 WHERE (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs <= 0.21 
                                  AND amm.job_category = 'Ops'""")
     ]
     
@@ -501,17 +528,16 @@ def create_weight_loss_analysis(cursor):
                 'Weight Loss Outcomes' as metric_category,
                 'All Users' as time_period,
                 '{group_name}' as user_group,
-                COUNT(DISTINCT hos.user_id) as total_users_with_data,
-                ROUND(AVG(hos.weight_loss_lbs), 2) as avg_weight_loss_lbs,
-                ROUND(AVG(hos.weight_loss_pct), 2) as avg_percent_weight_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) as users_5_percent_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) as users_10_percent_loss,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_5_percent,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_10_percent
-            FROM tmp_health_outcomes_summary hos
+                COUNT(DISTINCT bw.user_id) as total_users_with_data,
+                ROUND(AVG(bw.baseline_weight_lbs - lw.latest_weight_lbs), 2) as avg_weight_loss_lbs,
+                ROUND(AVG((bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs * 100), 2) as avg_percent_weight_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) as users_5_percent_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) as users_10_percent_loss,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_5_percent,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_10_percent
+            FROM tmp_baseline_weight_all bw
+            JOIN tmp_latest_weight_all lw ON bw.user_id = lw.user_id
             {join_where_clause}
-            AND hos.baseline_weight_lbs IS NOT NULL 
-            AND hos.latest_weight_lbs IS NOT NULL
         """
         
         execute_with_timing(cursor, base_query, f"Insert {group_name} analysis")
@@ -539,19 +565,19 @@ def create_blood_pressure_analysis(cursor):
         )
     """, "Create BP analysis table structure")
     
-    # Define BP groups - FIXED
+    # Define all user groups for BP analysis (FIXED JOINS)
     bp_groups = [
-        ('All Users', ''),  # No filter - all users with BP data
+        ('All Users', ''),
         ('Corporate', "JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
         ('Ops', "JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
-        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id'),  # All GLP1 users
+        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id'),
         ('Corporate GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
                                    JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
                                    WHERE amm.job_category = 'Corporate'"""),
         ('Ops GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
                               JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
                               WHERE amm.job_category = 'Ops'"""),
-        ('No GLP1 Users', 'LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id WHERE glp.user_id IS NULL'),  # All No-GLP1 users
+        ('No GLP1 Users', 'LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id WHERE glp.user_id IS NULL'),
         ('Corporate No GLP1 Users', """LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
                                       JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
                                       WHERE glp.user_id IS NULL AND amm.job_category = 'Corporate'"""),
@@ -609,12 +635,12 @@ def create_a1c_analysis(cursor, end_date='2025-12-31'):
         )
     """, "Create A1C analysis table structure")
     
-    # Define A1C groups - FIXED  
+    # Define all user groups for A1C analysis (FIXED JOINS)
     a1c_groups = [
-        ('All Users', ''),  # No filter - all users with A1C data
+        ('All Users', ''),
         ('Corporate', "JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
         ('Ops', "JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
-        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id'),  # All GLP1 users
+        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id'),
         ('Corporate GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id 
                                    JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
                                    WHERE amm.job_category = 'Corporate'"""),
@@ -657,8 +683,8 @@ def create_a1c_analysis(cursor, end_date='2025-12-31'):
         execute_with_timing(cursor, a1c_query, f"Insert {group_name} A1C analysis")
 
 def create_demographic_weight_loss_analysis(cursor):
-    """Create demographic weight loss analysis with job categories"""
-    print(f"\n📊 Creating demographic weight loss analysis...")
+    """Create demographic-specific weight loss analysis"""
+    print(f"\n👥 Creating demographic weight loss analysis...")
     
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_demographic_weight_analysis", "Drop demographic weight analysis table")
     
@@ -668,6 +694,7 @@ def create_demographic_weight_loss_analysis(cursor):
             metric_category VARCHAR(255),
             time_period VARCHAR(50),
             user_group VARCHAR(100),
+            demographic_segment VARCHAR(100),
             total_users_with_data INT,
             avg_weight_loss_lbs DECIMAL(10,2),
             avg_percent_weight_loss DECIMAL(10,2),
@@ -678,7 +705,7 @@ def create_demographic_weight_loss_analysis(cursor):
         )
     """, "Create demographic weight analysis table structure")
     
-    # Define original demographic groups (restored from no_CorpsOps script)
+    # Define demographic groups (using the working format from your original script)
     demographics = [
         ('Female', 'FEMALE', 'sex'),
         ('Male', 'MALE', 'sex'),
@@ -690,55 +717,51 @@ def create_demographic_weight_loss_analysis(cursor):
     # Insert results for each demographic group
     for demo_name, demo_value, demo_field in demographics:
         # All users in demographic
-        demo_query = f"""
+        execute_with_timing(cursor, f"""
             INSERT INTO tmp_demographic_weight_analysis
             SELECT 
-                'Demographic Weight Analysis' as metric_category,
+                'Weight Loss by Demographics' as metric_category,
                 'All Users' as time_period,
                 '{demo_name}' as user_group,
-                COUNT(DISTINCT hos.user_id) as total_users_with_data,
-                ROUND(AVG(hos.weight_loss_lbs), 2) as avg_weight_loss_lbs,
-                ROUND(AVG(hos.weight_loss_pct), 2) as avg_percent_weight_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) as users_5_percent_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) as users_10_percent_loss,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_5_percent,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_10_percent
-            FROM tmp_health_outcomes_summary hos
-            JOIN users u ON hos.user_id = u.id
-            WHERE hos.baseline_weight_lbs IS NOT NULL 
-            AND hos.latest_weight_lbs IS NOT NULL
-            AND u.{demo_field} = '{demo_value}'
-        """
-        
-        execute_with_timing(cursor, demo_query, f"Insert {demo_name} demographic analysis")
+                '{demo_name}' as demographic_segment,
+                COUNT(DISTINCT bw.user_id) as total_users_with_data,
+                ROUND(AVG(bw.baseline_weight_lbs - lw.latest_weight_lbs), 2) as avg_weight_loss_lbs,
+                ROUND(AVG((bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs * 100), 2) as avg_percent_weight_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) as users_5_percent_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) as users_10_percent_loss,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_5_percent,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_10_percent
+            FROM tmp_baseline_weight_all bw
+            JOIN tmp_latest_weight_all lw ON bw.user_id = lw.user_id
+            JOIN users u ON bw.user_id = u.id
+            WHERE u.{demo_field} = '{demo_value}'
+        """, f"Insert {demo_name} analysis")
         
         # GLP1 users in demographic
-        demo_glp1_query = f"""
+        execute_with_timing(cursor, f"""
             INSERT INTO tmp_demographic_weight_analysis
             SELECT 
-                'Demographic Weight Analysis' as metric_category,
+                'Weight Loss by Demographics' as metric_category,
                 'All Users' as time_period,
                 '{demo_name} GLP1 Users' as user_group,
-                COUNT(DISTINCT hos.user_id) as total_users_with_data,
-                ROUND(AVG(hos.weight_loss_lbs), 2) as avg_weight_loss_lbs,
-                ROUND(AVG(hos.weight_loss_pct), 2) as avg_percent_weight_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) as users_5_percent_loss,
-                COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) as users_10_percent_loss,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_5_percent,
-                ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_10_percent
-            FROM tmp_health_outcomes_summary hos
-            JOIN users u ON hos.user_id = u.id
-            WHERE hos.baseline_weight_lbs IS NOT NULL 
-            AND hos.latest_weight_lbs IS NOT NULL
-            AND hos.is_glp1_user = 1
-            AND u.{demo_field} = '{demo_value}'
-        """
-        
-        execute_with_timing(cursor, demo_glp1_query, f"Insert {demo_name} GLP1 demographic analysis")
+                '{demo_name} GLP1' as demographic_segment,
+                COUNT(DISTINCT bw.user_id) as total_users_with_data,
+                ROUND(AVG(bw.baseline_weight_lbs - lw.latest_weight_lbs), 2) as avg_weight_loss_lbs,
+                ROUND(AVG((bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs * 100), 2) as avg_percent_weight_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) as users_5_percent_loss,
+                COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) as users_10_percent_loss,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.05 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_5_percent,
+                ROUND((COUNT(DISTINCT CASE WHEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs >= 0.10 THEN bw.user_id END) * 100.0 / COUNT(DISTINCT bw.user_id)), 2) as percent_achieving_10_percent
+            FROM tmp_baseline_weight_all bw
+            JOIN tmp_latest_weight_all lw ON bw.user_id = lw.user_id
+            JOIN tmp_amazon_glp1_users_all glp ON bw.user_id = glp.user_id
+            JOIN users u ON bw.user_id = u.id
+            WHERE u.{demo_field} = '{demo_value}'
+        """, f"Insert {demo_name} GLP1 analysis")
 
 def create_demographic_a1c_analysis(cursor):
-    """Create demographic A1C analysis with original demographics"""
-    print(f"\n🩺 Creating demographic A1C analysis...")
+    """Create demographic-specific A1C analysis"""
+    print(f"\n👥 Creating demographic A1C analysis...")
     
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_demographic_a1c_analysis", "Drop demographic A1C analysis table")
     
@@ -748,6 +771,7 @@ def create_demographic_a1c_analysis(cursor):
             metric_category VARCHAR(255),
             time_period VARCHAR(50),
             user_group VARCHAR(100),
+            demographic_segment VARCHAR(100),
             total_users_with_data INT,
             prediabetic_users INT,
             diabetic_users INT,
@@ -755,13 +779,12 @@ def create_demographic_a1c_analysis(cursor):
             avg_baseline_a1c DECIMAL(10,2),
             avg_latest_a1c DECIMAL(10,2),
             avg_a1c_improvement DECIMAL(10,2),
-            prediabetic_avg_improvement DECIMAL(10,2),
-            diabetic_avg_improvement DECIMAL(10,2),
-            uncontrolled_diabetic_avg_improvement DECIMAL(10,2)
+            users_with_significant_improvement INT,
+            percent_with_significant_improvement DECIMAL(10,2)
         )
     """, "Create demographic A1C analysis table structure")
     
-    # Define original demographic groups (restored from no_CorpsOps script)
+    # Define demographic groups
     demographics = [
         ('Female', 'FEMALE', 'sex'),
         ('Male', 'MALE', 'sex'),
@@ -770,122 +793,54 @@ def create_demographic_a1c_analysis(cursor):
         ('Asian', 'ASIAN', 'ethnicity')
     ]
     
-    # Generate queries for all demographic groups
+    # Insert results for each demographic group
     for demo_name, demo_value, demo_field in demographics:
-        demo_a1c_query = f"""
+        # All users in demographic
+        execute_with_timing(cursor, f"""
             INSERT INTO tmp_demographic_a1c_analysis
             SELECT 
-                'Demographic A1C Analysis' as metric_category,
+                'A1C by Demographics' as metric_category,
                 'All Users' as time_period,
                 '{demo_name}' as user_group,
-                COUNT(DISTINCT hos.user_id) as total_users_with_data,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 5.7 THEN hos.user_id END) as prediabetic_users,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 6.5 AND hos.baseline_a1c < 7.0 THEN hos.user_id END) as diabetic_users,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 7.0 THEN hos.user_id END) as uncontrolled_diabetic_users,
-                ROUND(AVG(hos.baseline_a1c), 2) as avg_baseline_a1c,
-                ROUND(AVG(hos.latest_a1c), 2) as avg_latest_a1c,
-                ROUND(AVG(hos.a1c_delta), 2) as avg_a1c_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 5.7 THEN hos.a1c_delta END), 2) as prediabetic_avg_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 6.5 AND hos.baseline_a1c < 7.0 THEN hos.a1c_delta END), 2) as diabetic_avg_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 7.0 THEN hos.a1c_delta END), 2) as uncontrolled_diabetic_avg_improvement
-            FROM tmp_health_outcomes_summary hos
-            JOIN users u ON hos.user_id = u.id
-            WHERE hos.baseline_a1c IS NOT NULL 
-            AND hos.latest_a1c IS NOT NULL
-            AND u.{demo_field} = '{demo_value}'
-        """
-        
-        execute_with_timing(cursor, demo_a1c_query, f"Insert {demo_name} demographic A1C analysis")
+                '{demo_name}' as demographic_segment,
+                COUNT(DISTINCT ba1c.user_id) as total_users_with_data,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 5.7 AND ba1c.baseline_a1c < 6.5 THEN ba1c.user_id END) as prediabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 6.5 AND ba1c.baseline_a1c < 7.0 THEN ba1c.user_id END) as diabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 7.0 THEN ba1c.user_id END) as uncontrolled_diabetic_users,
+                ROUND(AVG(ba1c.baseline_a1c), 2) as avg_baseline_a1c,
+                ROUND(AVG(la1c.latest_a1c), 2) as avg_latest_a1c,
+                ROUND(AVG(ba1c.baseline_a1c - la1c.latest_a1c), 2) as avg_a1c_improvement,
+                COUNT(DISTINCT CASE WHEN (ba1c.baseline_a1c - la1c.latest_a1c) >= 0.5 THEN ba1c.user_id END) as users_with_significant_improvement,
+                ROUND((COUNT(DISTINCT CASE WHEN (ba1c.baseline_a1c - la1c.latest_a1c) >= 0.5 THEN ba1c.user_id END) * 100.0 / COUNT(DISTINCT ba1c.user_id)), 2) as percent_with_significant_improvement
+            FROM tmp_baseline_a1c_all ba1c
+            JOIN tmp_latest_a1c_all la1c ON ba1c.user_id = la1c.user_id
+            JOIN users u ON ba1c.user_id = u.id
+            WHERE u.{demo_field} = '{demo_value}'
+        """, f"Insert {demo_name} A1C analysis")
         
         # GLP1 users in demographic
-        demo_glp1_a1c_query = f"""
+        execute_with_timing(cursor, f"""
             INSERT INTO tmp_demographic_a1c_analysis
             SELECT 
-                'Demographic A1C Analysis' as metric_category,
+                'A1C by Demographics' as metric_category,
                 'All Users' as time_period,
                 '{demo_name} GLP1 Users' as user_group,
-                COUNT(DISTINCT hos.user_id) as total_users_with_data,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 5.7 THEN hos.user_id END) as prediabetic_users,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 6.5 AND hos.baseline_a1c < 7.0 THEN hos.user_id END) as diabetic_users,
-                COUNT(DISTINCT CASE WHEN hos.baseline_a1c >= 7.0 THEN hos.user_id END) as uncontrolled_diabetic_users,
-                ROUND(AVG(hos.baseline_a1c), 2) as avg_baseline_a1c,
-                ROUND(AVG(hos.latest_a1c), 2) as avg_latest_a1c,
-                ROUND(AVG(hos.a1c_delta), 2) as avg_a1c_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 5.7 THEN hos.a1c_delta END), 2) as prediabetic_avg_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 6.5 AND hos.baseline_a1c < 7.0 THEN hos.a1c_delta END), 2) as diabetic_avg_improvement,
-                ROUND(AVG(CASE WHEN hos.baseline_a1c >= 7.0 THEN hos.a1c_delta END), 2) as uncontrolled_diabetic_avg_improvement
-            FROM tmp_health_outcomes_summary hos
-            JOIN users u ON hos.user_id = u.id
-            WHERE hos.baseline_a1c IS NOT NULL 
-            AND hos.latest_a1c IS NOT NULL
-            AND hos.is_glp1_user = 1
-            AND u.{demo_field} = '{demo_value}'
-        """
-        
-        execute_with_timing(cursor, demo_glp1_a1c_query, f"Insert {demo_name} GLP1 demographic A1C analysis")
-        
-def create_health_outcomes_summary_table(cursor, end_date='2025-12-31'):
-    """Create health outcomes summary using 6-month retention users with 30+ day requirements"""
-    print(f"\n📊 Creating health outcomes summary table (30+ day requirements)...")
-    
-    execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_health_outcomes_summary", "Drop health outcomes summary table")
-    execute_with_timing(cursor, f"""
-        CREATE TEMPORARY TABLE tmp_health_outcomes_summary AS
-        SELECT 
-            -- User categorization
-            au.user_id,
-            CASE WHEN glp1.user_id IS NOT NULL THEN 1 ELSE 0 END as is_glp1_user,
-            
-            -- Weight data (30+ days required between measurements)
-            CASE WHEN bw.baseline_weight_lbs IS NOT NULL AND lw.latest_weight_lbs IS NOT NULL 
-                 AND DATEDIFF(lw.latest_weight_date, bw.baseline_weight_date) >= 30
-                 THEN bw.baseline_weight_lbs END as baseline_weight_lbs,
-            CASE WHEN bw.baseline_weight_lbs IS NOT NULL AND lw.latest_weight_lbs IS NOT NULL 
-                 AND DATEDIFF(lw.latest_weight_date, bw.baseline_weight_date) >= 30
-                 THEN lw.latest_weight_lbs END as latest_weight_lbs,
-            CASE WHEN bw.baseline_weight_lbs IS NOT NULL AND lw.latest_weight_lbs IS NOT NULL 
-                 AND DATEDIFF(lw.latest_weight_date, bw.baseline_weight_date) >= 30
-                 THEN (bw.baseline_weight_lbs - lw.latest_weight_lbs) / bw.baseline_weight_lbs * 100 END as weight_loss_pct,
-            CASE WHEN bw.baseline_weight_lbs IS NOT NULL AND lw.latest_weight_lbs IS NOT NULL 
-                 AND DATEDIFF(lw.latest_weight_date, bw.baseline_weight_date) >= 30
-                 THEN bw.baseline_weight_lbs - lw.latest_weight_lbs END as weight_loss_lbs,
-            
-            -- A1C data (30+ days required between measurements)
-            CASE WHEN ba1c.baseline_a1c IS NOT NULL AND la1c.latest_a1c IS NOT NULL 
-                 AND DATEDIFF(la1c.latest_a1c_date, ba1c.baseline_a1c_date) >= 30
-                 THEN ba1c.baseline_a1c END as baseline_a1c,
-            CASE WHEN ba1c.baseline_a1c IS NOT NULL AND la1c.latest_a1c IS NOT NULL 
-                 AND DATEDIFF(la1c.latest_a1c_date, ba1c.baseline_a1c_date) >= 30
-                 THEN la1c.latest_a1c END as latest_a1c,
-            CASE WHEN ba1c.baseline_a1c IS NOT NULL AND la1c.latest_a1c IS NOT NULL 
-                 AND DATEDIFF(la1c.latest_a1c_date, ba1c.baseline_a1c_date) >= 30
-                 THEN ba1c.baseline_a1c - la1c.latest_a1c END as a1c_delta,
-            
-            -- Blood pressure data (30+ days required between measurements)
-            CASE WHEN bbp.baseline_systolic IS NOT NULL AND lbp.latest_systolic IS NOT NULL 
-                 AND DATEDIFF(lbp.latest_bp_date, bbp.baseline_bp_date) >= 30
-                 THEN bbp.baseline_systolic END as baseline_systolic,
-            CASE WHEN bbp.baseline_systolic IS NOT NULL AND lbp.latest_systolic IS NOT NULL 
-                 AND DATEDIFF(lbp.latest_bp_date, bbp.baseline_bp_date) >= 30
-                 THEN bbp.baseline_diastolic END as baseline_diastolic,
-            CASE WHEN bbp.baseline_systolic IS NOT NULL AND lbp.latest_systolic IS NOT NULL 
-                 AND DATEDIFF(lbp.latest_bp_date, bbp.baseline_bp_date) >= 30
-                 THEN lbp.latest_systolic END as latest_systolic,
-            CASE WHEN bbp.baseline_systolic IS NOT NULL AND lbp.latest_systolic IS NOT NULL 
-                 AND DATEDIFF(lbp.latest_bp_date, bbp.baseline_bp_date) >= 30
-                 THEN lbp.latest_diastolic END as latest_diastolic
-            
-        FROM tmp_amazon_users_6month au  -- 6-MONTH RETENTION USERS
-        LEFT JOIN tmp_baseline_weight_all bw ON au.user_id = bw.user_id
-        LEFT JOIN tmp_latest_weight_all lw ON au.user_id = lw.user_id
-        LEFT JOIN tmp_baseline_a1c_all ba1c ON au.user_id = ba1c.user_id
-        LEFT JOIN tmp_latest_a1c_all la1c ON au.user_id = la1c.user_id
-        LEFT JOIN tmp_baseline_blood_pressure_all bbp ON au.user_id = bbp.user_id
-        LEFT JOIN tmp_latest_blood_pressure_all lbp ON au.user_id = lbp.user_id
-        LEFT JOIN tmp_amazon_glp1_users_all glp1 ON au.user_id = glp1.user_id
-    """, "Create health outcomes summary table (30+ day requirements)")
-    
-    execute_with_timing(cursor, "CREATE INDEX idx_health_outcomes_summary_user_id ON tmp_health_outcomes_summary(user_id)", "Index health outcomes summary table")
+                '{demo_name} GLP1' as demographic_segment,
+                COUNT(DISTINCT ba1c.user_id) as total_users_with_data,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 5.7 AND ba1c.baseline_a1c < 6.5 THEN ba1c.user_id END) as prediabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 6.5 AND ba1c.baseline_a1c < 7.0 THEN ba1c.user_id END) as diabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 7.0 THEN ba1c.user_id END) as uncontrolled_diabetic_users,
+                ROUND(AVG(ba1c.baseline_a1c), 2) as avg_baseline_a1c,
+                ROUND(AVG(la1c.latest_a1c), 2) as avg_latest_a1c,
+                ROUND(AVG(ba1c.baseline_a1c - la1c.latest_a1c), 2) as avg_a1c_improvement,
+                COUNT(DISTINCT CASE WHEN (ba1c.baseline_a1c - la1c.latest_a1c) >= 0.5 THEN ba1c.user_id END) as users_with_significant_improvement,
+                ROUND((COUNT(DISTINCT CASE WHEN (ba1c.baseline_a1c - la1c.latest_a1c) >= 0.5 THEN ba1c.user_id END) * 100.0 / COUNT(DISTINCT ba1c.user_id)), 2) as percent_with_significant_improvement
+            FROM tmp_baseline_a1c_all ba1c
+            JOIN tmp_latest_a1c_all la1c ON ba1c.user_id = la1c.user_id
+            JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id
+            JOIN users u ON ba1c.user_id = u.id
+            WHERE u.{demo_field} = '{demo_value}'
+        """, f"Insert {demo_name} GLP1 A1C analysis")
 
 def export_results_to_excel(cursor, filename='amazon_qbr_results.xlsx'):
     """Export all analysis results to Excel with separate sheets"""
@@ -1116,7 +1071,6 @@ def main_amazon_analysis(end_date='2025-12-31'):
                 create_weight_metrics_tables(cursor, end_date=end_date)
                 create_blood_pressure_tables(cursor, end_date=end_date)
                 create_a1c_metrics_tables(cursor, end_date=end_date)
-                create_health_outcomes_summary_table(cursor, end_date=end_date)  # ADD THIS LINE
                 
                 # Create analysis tables
                 create_weight_loss_analysis(cursor)
@@ -1125,7 +1079,6 @@ def main_amazon_analysis(end_date='2025-12-31'):
                 create_hypertension_analysis(cursor)
                 create_a1c_analysis(cursor)
                 create_demographic_a1c_analysis(cursor)
-                create_health_outcomes_summary_table(cursor, end_date=end_date)  # NEW - Create health outcomes summary table
                 
                 # Export results to Excel
                 export_results_to_excel(cursor)
@@ -1140,14 +1093,12 @@ def main_amazon_analysis(end_date='2025-12-31'):
                 cleanup_tables = [
                     'tmp_amazon_users_all', 'tmp_amazon_users_6month', 
                     'tmp_amazon_members_mapping',  # NEW
-                    'tmp_health_outcomes_summary',  # ADD THIS LINE
                     'tmp_amazon_glp1_users_all', 'tmp_amazon_no_glp1_users_all',
                     'tmp_baseline_weight_all', 'tmp_latest_weight_all',
                     'tmp_baseline_blood_pressure_all', 'tmp_latest_blood_pressure_all',
                     'tmp_baseline_a1c_all', 'tmp_latest_a1c_all',
                     'tmp_weight_loss_analysis', 'tmp_demographic_weight_analysis', 'tmp_bp_analysis',
-                    'tmp_hypertension_analysis', 'tmp_a1c_analysis', 'tmp_demographic_a1c_analysis',
-                    'tmp_health_outcomes_summary'  # NEW - Cleanup health outcomes summary table
+                    'tmp_hypertension_analysis', 'tmp_a1c_analysis', 'tmp_demographic_a1c_analysis'
                 ]
                 for table in cleanup_tables:
                     execute_with_timing(cursor, f"DROP TEMPORARY TABLE IF EXISTS {table}", f"Cleanup {table}")

@@ -546,3 +546,40 @@ join providers pr on ap2.user_id = pr.user_id
 WHERE ap.created_at >= '2025-07-01' AND ap.created_at <= '2025-09-30'
 GROUP BY ap.appointment_type
 ORDER BY ap.appointment_type, ROUND(AVG(available_after_minutes_excl_weekend / 60), 2) DESC;
+
+
+
+------------ These Queries need to be ran in the Backend DB --------------- 
+------ USERS With and Without PCP ------- 
+select count(DISTINCT s.user_id) from subscription_subscriptions s
+  join preferences_preferences pp ON pp.user_id = s.user_id
+  where BIN_TO_UUID(s.plan_id) = 'a0a861eb-9bbe-4faf-88c7-2cb5b4ae2432'
+  and status='active' 
+  AND s.start_date <= '2026-01-01'
+  AND s.start_date >= '2025-10-01'
+  and pp.key = 'physicians.primary.first-name';
+
+  SELECT COUNT(DISTINCT s.user_id)
+FROM subscription_subscriptions s
+WHERE BIN_TO_UUID(s.plan_id) = 'a0a861eb-9bbe-4faf-88c7-2cb5b4ae2432'
+  AND s.status = 'active'
+  AND s.start_date <= '2026-01-01'
+  AND s.start_date >= '2025-10-01'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM preferences_preferences pp
+      WHERE pp.user_id = s.user_id
+        AND pp.key = 'physicians.primary.first-name'
+  );
+
+------------------ Physician sent a care summary ------------- 
+
+
+SELECT count(distinct s.user_id) FROM lifeline_user_items lli
+JOIN subscription_subscriptions s ON s.user_id = lli.user_id
+WHERE s.status = 'ACTIVE'
+    AND BIN_TO_UUID(s.plan_id) = 'a0a861eb-9bbe-4faf-88c7-2cb5b4ae2432'
+  AND s.start_date <= '2026-01-01'
+  AND s.start_date >= '2025-10-01'
+  AND lli.item_type = 'communication.sent'
+ORDER BY lli.timestamp DESC;
