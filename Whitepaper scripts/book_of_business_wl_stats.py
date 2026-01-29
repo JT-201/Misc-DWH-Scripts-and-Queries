@@ -249,7 +249,7 @@ def main():
         users = filter_by_bmi(users, bmi) # BMI >= 30
         
         bill = get_billable_activity(conn, ANALYSIS_END)
-        users = filter_continuous_engagement(users, bill) # 6+ Months Streak
+        users = filter_continuous_engagement(users, bill, min_months=12) # 6+ Months Streak
         
         if users.empty:
             print("No users met base criteria.")
