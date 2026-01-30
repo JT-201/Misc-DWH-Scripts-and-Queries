@@ -385,72 +385,52 @@ def create_amazon_members_mapping(cursor):
         print(f"    • {job_cat}: {count} users")
 
 def create_hypertension_analysis(cursor):
-    """Create hypertension-focused analysis with FIXED Corporate/Ops breakdowns"""
-    print(f"\n🫀 Creating hypertension analysis...")
-    
+    """Create hypertension analysis for all, stage 1, stage 2, and BP>130/80"""
+    print(f"\n🫀 Creating hypertension analysis (Stage 1 & 2)...")
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_hypertension_analysis", "Drop hypertension analysis table")
-    
-    # Create the table structure first
     execute_with_timing(cursor, """
         CREATE TEMPORARY TABLE tmp_hypertension_analysis (
-            metric_category VARCHAR(255),
-            time_period VARCHAR(50),
-            user_group VARCHAR(100),
-            total_users_with_data INT,
-            uncontrolled_baseline_users INT,
-            users_with_significant_bp_drop INT,
-            percent_with_significant_bp_drop DECIMAL(10,2),
-            avg_systolic_improvement DECIMAL(10,1),
-            avg_diastolic_improvement DECIMAL(10,1),
-            users_normalized_bp INT,
-            percent_normalized_bp DECIMAL(10,2)
+            group_name VARCHAR(64),
+            n_users INT,
+            avg_baseline_systolic DECIMAL(10,1),
+            avg_baseline_diastolic DECIMAL(10,1),
+            avg_latest_systolic DECIMAL(10,1),
+            avg_latest_diastolic DECIMAL(10,1),
+            avg_systolic_change DECIMAL(10,1),
+            avg_diastolic_change DECIMAL(10,1)
         )
     """, "Create hypertension analysis table structure")
-    
-    # Define hypertension user groups (FIXED JOINS)
-    hypertension_groups = [
-        ('All Hypertensive Users', ''),
-        ('Corporate Hypertensive', "JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
-        ('Ops Hypertensive', "JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
-        ('Hypertensive GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id'),
-        ('Corporate Hypertensive GLP1', """JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
-                                          JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
-                                          WHERE amm.job_category = 'Corporate'"""),
-        ('Ops Hypertensive GLP1', """JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
-                                     JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
-                                     WHERE amm.job_category = 'Ops'"""),
-        ('Hypertensive No GLP1', 'LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id WHERE glp.user_id IS NULL'),
-        ('Corporate Hypertensive No GLP1', """LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
-                                              JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
-                                              WHERE glp.user_id IS NULL AND amm.job_category = 'Corporate'"""),
-        ('Ops Hypertensive No GLP1', """LEFT JOIN tmp_amazon_glp1_users_all glp ON bbb.user_id = glp.user_id 
-                                        JOIN tmp_amazon_members_mapping amm ON bbb.user_id = amm.user_id 
-                                        WHERE glp.user_id IS NULL AND amm.job_category = 'Ops'""")
+
+    groups = [
+        # (name, WHERE clause)
+        ("All Users", ""),  # No filter
+        ("BP > 130/80", "WHERE (bbb.baseline_systolic > 130 OR bbb.baseline_diastolic > 80)"),
+        ("Stage 1 Hypertension", """
+            WHERE (
+                ((bbb.baseline_systolic BETWEEN 130 AND 139) OR (bbb.baseline_diastolic BETWEEN 80 AND 89))
+                AND NOT (bbb.baseline_systolic >= 140 OR bbb.baseline_diastolic >= 90)
+            )
+        """),
+        ("Stage 2 Hypertension", "WHERE (bbb.baseline_systolic >= 140 OR bbb.baseline_diastolic >= 90)")
     ]
-    
-    # Generate queries for all hypertension groups
-    for group_name, join_where_clause in hypertension_groups:
-        hypertension_query = f"""
+
+    for group_name, where_clause in groups:
+        query = f"""
             INSERT INTO tmp_hypertension_analysis
-            SELECT 
-                'Hypertension Management' as metric_category,
-                'Uncontrolled BP Users' as time_period,
-                '{group_name}' as user_group,
-                COUNT(DISTINCT bbb.user_id) as total_users_with_data,
-                COUNT(DISTINCT bbb.user_id) as uncontrolled_baseline_users,
-                COUNT(DISTINCT CASE WHEN ((bbb.baseline_systolic - lbb.latest_systolic) >= 10 OR (bbb.baseline_diastolic - lbb.latest_diastolic) >= 5) THEN bbb.user_id END) as users_with_significant_bp_drop,
-                ROUND((COUNT(DISTINCT CASE WHEN ((bbb.baseline_systolic - lbb.latest_systolic) >= 10 OR (bbb.baseline_diastolic - lbb.latest_diastolic) >= 5) THEN bbb.user_id END) * 100.0 / COUNT(DISTINCT bbb.user_id)), 2) as percent_with_significant_bp_drop,
-                ROUND(AVG(bbb.baseline_systolic - lbb.latest_systolic), 1) as avg_systolic_improvement,
-                ROUND(AVG(bbb.baseline_diastolic - lbb.latest_diastolic), 1) as avg_diastolic_improvement,
-                COUNT(DISTINCT CASE WHEN (lbb.latest_systolic < 140 AND lbb.latest_diastolic < 90) THEN bbb.user_id END) as users_normalized_bp,
-                ROUND((COUNT(DISTINCT CASE WHEN (lbb.latest_systolic < 140 AND lbb.latest_diastolic < 90) THEN bbb.user_id END) * 100.0 / COUNT(DISTINCT bbb.user_id)), 2) as percent_normalized_bp
+            SELECT
+                '{group_name}' as group_name,
+                COUNT(DISTINCT bbb.user_id) as n_users,
+                ROUND(AVG(bbb.baseline_systolic),1) as avg_baseline_systolic,
+                ROUND(AVG(bbb.baseline_diastolic),1) as avg_baseline_diastolic,
+                ROUND(AVG(lbb.latest_systolic),1) as avg_latest_systolic,
+                ROUND(AVG(lbb.latest_diastolic),1) as avg_latest_diastolic,
+                ROUND(AVG(bbb.baseline_systolic - lbb.latest_systolic),1) as avg_systolic_change,
+                ROUND(AVG(bbb.baseline_diastolic - lbb.latest_diastolic),1) as avg_diastolic_change
             FROM tmp_baseline_blood_pressure_all bbb
             JOIN tmp_latest_blood_pressure_all lbb ON bbb.user_id = lbb.user_id
-            {join_where_clause}
-            AND (bbb.baseline_systolic >= 140 OR bbb.baseline_diastolic >= 90)
+            {where_clause}
         """
-        
-        execute_with_timing(cursor, hypertension_query, f"Insert {group_name} hypertension analysis")
+        execute_with_timing(cursor, query, f"Insert {group_name} hypertension analysis")
 
 def create_weight_loss_analysis(cursor):
     """Create comprehensive weight loss analysis with Corporate/Ops breakdowns"""
@@ -823,7 +803,7 @@ def create_demographic_a1c_analysis(cursor):
         """
         
         execute_with_timing(cursor, demo_glp1_a1c_query, f"Insert {demo_name} GLP1 demographic A1C analysis")
-        
+
 def create_health_outcomes_summary_table(cursor, end_date='2025-12-31'):
     """Create health outcomes summary using 6-month retention users with 30+ day requirements"""
     print(f"\n📊 Creating health outcomes summary table (30+ day requirements)...")
