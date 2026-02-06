@@ -271,14 +271,13 @@ LEFT JOIN nps_latest nps ON u.user_id = nps.user_id AND nps.rn = 1
 LEFT JOIN csat_stats csat ON u.user_id = csat.user_id
 
 // Custom Sql 2 (Questionnaire responses)
-ITH 
+WITH 
 -- 1. DEFINE REPORT DATE
 vars AS (
     SELECT CAST('2026-02-01' AS DATE) AS report_date
 ),
 
 -- 2. ACTIVE MEMBERS SNAPSHOT
--- We filter first to ensure we only pull data for relevant, active users
 active_members AS (
     SELECT 
         u.id AS user_id,
@@ -297,15 +296,11 @@ active_members AS (
           AND upm.program IN ('HEALTHY_WEIGHT_JOURNEY', 'weightloss')
       )
 )
-
--- 3. FETCH SURVEY RECORDS
-SELECT 
-    am.user_id,
+-- 3.  SURVEY RECORDS
+SELECT
     am.readable_id,
     am.employer_name,
     qr.questionnaire_id,
-    -- If your table has a 'questionnaire_title' column, use it. 
-    -- Otherwise, this will just return the ID.
     qr.questionnaire_id AS questionnaire_title, 
     qr.question_id,
     qr.answered_at,
