@@ -50,7 +50,7 @@ billable_stats_lifetime AS (
     GROUP BY b.user_id
 ),
 
--- 4. GLP-1 STATS
+-- 4. GLP-1 STATS (Specific Drug Class)
 glp_stats AS (
     SELECT 
         p.patient_user_id AS user_id,
@@ -65,38 +65,103 @@ glp_stats AS (
     GROUP BY p.patient_user_id
 ),
 
--- 5. VITALS (Ranks)
-weight_ranks AS (
-    SELECT user_id, effective_date, value AS weight,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date ASC) as rn_asc,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_desc
-    FROM body_weight_values_cleaned b JOIN vars v ON 1=1 WHERE b.effective_date <= v.report_date
-),
-bmi_ranks AS (
-    SELECT user_id, effective_date, value AS bmi,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date ASC) as rn_asc,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_desc
-    FROM bmi_values_cleaned b JOIN vars v ON 1=1 WHERE b.effective_date <= v.report_date
-),
-bp_ranks AS (
-    SELECT user_id, effective_date, systolic, diastolic,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date ASC) as rn_asc,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_desc
-    FROM blood_pressure_values b JOIN vars v ON 1=1 WHERE b.effective_date <= v.report_date
-),
-a1c_ranks AS (
-    SELECT user_id, effective_date, value AS a1c,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date ASC) as rn_asc,
-           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_desc
-    FROM a1c_values b JOIN vars v ON 1=1 WHERE b.effective_date <= v.report_date
+-- 4b. ANTI-HYPERGLYCEMIC MEDS FLAG (Name Search)
+hyperglycemic_meds AS (
+    SELECT DISTINCT p.patient_user_id AS user_id
+    FROM prescriptions p
+    JOIN medication_ndcs mn ON p.prescribed_ndc = mn.ndc
+    JOIN medications m ON mn.medication_id = m.id
+    WHERE (
+        LOWER(m.name) LIKE '%insulin%' OR LOWER(m.name) LIKE '%humalog%' OR LOWER(m.name) LIKE '%novolog%' OR LOWER(m.name) LIKE '%lantus%' OR LOWER(m.name) LIKE '%basaglar%'
+        OR LOWER(m.name) LIKE '%metformin%' OR LOWER(m.name) LIKE '%glucophage%'
+        OR LOWER(m.name) LIKE '%glipizide%' OR LOWER(m.name) LIKE '%glimepiride%' OR LOWER(m.name) LIKE '%glyburide%'
+        OR LOWER(m.name) LIKE '%semaglutide%' OR LOWER(m.name) LIKE '%ozempic%' OR LOWER(m.name) LIKE '%wegovy%' OR LOWER(m.name) LIKE '%trulicity%' OR LOWER(m.name) LIKE '%mounjaro%'
+        OR LOWER(m.name) LIKE '%jardiance%' OR LOWER(m.name) LIKE '%farxiga%' OR LOWER(m.name) LIKE '%empagliflozin%'
+        OR LOWER(m.name) LIKE '%januvia%' OR LOWER(m.name) LIKE '%sitagliptin%'
+    )
 ),
 
--- 6. COMPLIANCE COUNTS
+-- 5. VITALS (Prioritized Window Logic)
+
+-- 5a. Weight (Source: CLEANED table for outcome values)
+weight_data AS (
+    SELECT b.user_id, b.effective_date, b.value AS weight,
+           CASE WHEN b.effective_date BETWEEN DATE_SUB(u.start_date, INTERVAL 60 DAY) AND DATE_ADD(u.start_date, INTERVAL 30 DAY) 
+                THEN 1 ELSE 2 END AS base_priority,
+           ABS(DATEDIFF(b.effective_date, u.start_date)) AS days_from_start
+    FROM body_weight_values_cleaned b 
+    JOIN base_users u ON b.user_id = u.user_id
+    JOIN vars v ON 1=1 
+    WHERE b.effective_date <= v.report_date
+),
+weight_ranks AS (
+    SELECT user_id, effective_date, weight, base_priority,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY base_priority ASC, days_from_start ASC) as rn_base,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_curr
+    FROM weight_data
+),
+
+-- 5b. BMI
+bmi_data AS (
+    SELECT b.user_id, b.effective_date, b.value AS bmi,
+           CASE WHEN b.effective_date BETWEEN DATE_SUB(u.start_date, INTERVAL 60 DAY) AND DATE_ADD(u.start_date, INTERVAL 30 DAY) 
+                THEN 1 ELSE 2 END AS base_priority,
+           ABS(DATEDIFF(b.effective_date, u.start_date)) AS days_from_start
+    FROM bmi_values_cleaned b 
+    JOIN base_users u ON b.user_id = u.user_id
+    JOIN vars v ON 1=1 
+    WHERE b.effective_date <= v.report_date
+),
+bmi_ranks AS (
+    SELECT user_id, effective_date, bmi, base_priority,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY base_priority ASC, days_from_start ASC) as rn_base,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_curr
+    FROM bmi_data
+),
+
+-- 5c. BP
+bp_data AS (
+    SELECT b.user_id, b.effective_date, b.systolic, b.diastolic,
+           CASE WHEN b.effective_date BETWEEN DATE_SUB(u.start_date, INTERVAL 60 DAY) AND DATE_ADD(u.start_date, INTERVAL 30 DAY) 
+                THEN 1 ELSE 2 END AS base_priority,
+           ABS(DATEDIFF(b.effective_date, u.start_date)) AS days_from_start
+    FROM blood_pressure_values b 
+    JOIN base_users u ON b.user_id = u.user_id
+    JOIN vars v ON 1=1 
+    WHERE b.effective_date <= v.report_date
+),
+bp_ranks AS (
+    SELECT user_id, effective_date, systolic, diastolic, base_priority,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY base_priority ASC, days_from_start ASC) as rn_base,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_curr
+    FROM bp_data
+),
+
+-- 5d. A1C
+a1c_data AS (
+    SELECT b.user_id, b.effective_date, b.value AS a1c,
+           CASE WHEN b.effective_date BETWEEN DATE_SUB(u.start_date, INTERVAL 60 DAY) AND DATE_ADD(u.start_date, INTERVAL 30 DAY) 
+                THEN 1 ELSE 2 END AS base_priority,
+           ABS(DATEDIFF(b.effective_date, u.start_date)) AS days_from_start
+    FROM a1c_values b 
+    JOIN base_users u ON b.user_id = u.user_id
+    JOIN vars v ON 1=1 
+    WHERE b.effective_date <= v.report_date
+),
+a1c_ranks AS (
+    SELECT user_id, effective_date, a1c, base_priority,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY base_priority ASC, days_from_start ASC) as rn_base,
+           ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY effective_date DESC) as rn_curr
+    FROM a1c_data
+),
+
+-- 6. COMPLIANCE COUNTS 
+-- Weight Source: UNCLEANED TABLE (body_weight_values) for pure engagement count
 weight_compliance AS (
     SELECT user_id, COUNT(*) as months_with_10plus_weights
     FROM (
         SELECT b.user_id, DATE_FORMAT(b.effective_date, '%Y-%m') as mth, COUNT(*) as cnt
-        FROM body_weight_values_cleaned b
+        FROM body_weight_values b  -- CHANGED to uncleaned table
         JOIN vars v ON 1=1
         WHERE b.effective_date <= v.report_date
         GROUP BY 1, 2
@@ -122,42 +187,6 @@ a1c_counts AS (
     JOIN vars v ON 1=1
     WHERE b.effective_date <= v.report_date
     GROUP BY b.user_id
-),
-
--- 7. NPS
-nps_latest AS (
-    SELECT qr.user_id, npsr.score, npsr.submitted_at,
-           ROW_NUMBER() OVER(PARTITION BY qr.user_id ORDER BY npsr.submitted_at DESC) as rn
-    FROM nps_response_records npsr
-    JOIN questionnaire_records qr ON npsr.questionnaire_id = qr.questionnaire_id
-    JOIN vars v ON 1=1
-    WHERE npsr.submitted_at <= v.report_date
-),
-
--- 8. CSAT SCORES (Normalized to 10-point scale)
-csat_stats AS (
-    SELECT 
-        qr.user_id,
-        COUNT(*) as csat_response_count,
-        AVG(
-            CASE 
-                -- If it's the 10-point question, take raw value
-                WHEN qr.question_id = 'LJ7hYbzFyc3o' AND qr.answer_text REGEXP '^[0-9]+(\.[0-9]+)?$' 
-                     THEN CAST(qr.answer_text AS DECIMAL(4,2))
-                
-                -- If it's any of the other 5-point questions, Multiply by 2
-                WHEN qr.question_id IN ('g4rg786D9C2q', 'UeNt46PgUv4A', 'AaIbKyE6VRkL', 'NRGXIAUDGjRv') 
-                     AND qr.answer_text REGEXP '^[0-9]+(\.[0-9]+)?$' 
-                     THEN CAST(qr.answer_text AS DECIMAL(4,2)) * 2
-                ELSE NULL 
-            END
-        ) as average_csat_score
-    FROM questionnaire_records qr
-    JOIN vars v ON 1=1
-    WHERE qr.questionnaire_id = 'fnZKqImJ'
-      AND qr.question_id IN ('g4rg786D9C2q', 'UeNt46PgUv4A', 'AaIbKyE6VRkL', 'NRGXIAUDGjRv', 'LJ7hYbzFyc3o')
-      AND qr.answered_at <= v.report_date
-    GROUP BY qr.user_id
 )
 
 -- =======================================================
@@ -180,34 +209,36 @@ SELECT
     COALESCE(bpc.months_with_5plus_bp, 0) AS count_months_5plus_bp,
     COALESCE(ac.total_a1c_records, 0) AS count_total_a1c,
 
-    -- NPS
-    nps.score AS latest_nps_score,
-    nps.submitted_at AS latest_nps_date,
-    CASE 
-        WHEN nps.score >= 9 THEN 'Promoter'
-        WHEN nps.score >= 7 THEN 'Passive'
-        WHEN nps.score <= 6 THEN 'Detractor'
-        ELSE 'No Score'
-    END AS nps_category,
-
-    -- CSAT (Average Score is OUT OF 10)
-    csat.average_csat_score,
-    COALESCE(csat.csat_response_count, 0) AS csat_response_count,
-
-    -- Meds
+    -- Meds Stats
     COALESCE(gs.total_days_covered, 0) AS glp1_days_covered,
     CASE 
         WHEN u.days_since_start > 0 THEN (1 - (COALESCE(gs.total_days_covered, 0) / u.days_since_start)) 
         ELSE 0 
     END AS glp1_gap_percentage,
+    
+    -- NEW FLAG: Ever Prescribed Anti-Hyperglycemic
+    CASE WHEN hm.user_id IS NOT NULL THEN 1 ELSE 0 END AS flag_ever_prescribed_hyperglycemic,
 
-    -- Vitals
+    -- Vitals (Baseline prioritized by Window)
     w_base.weight AS weight_baseline, w_base.effective_date AS weight_base_date,
     w_curr.weight AS weight_current, w_curr.effective_date AS weight_curr_date,
+    
     bmi_base.bmi AS bmi_baseline, bmi_curr.bmi AS bmi_current,
+    
     bp_base.systolic AS sys_baseline, bp_base.diastolic AS dia_baseline,
     bp_curr.systolic AS sys_current, bp_curr.diastolic AS dia_current,
+    
     a1c_base.a1c AS a1c_baseline, a1c_curr.a1c AS a1c_current,
+
+    -- FLAGS: Baseline Out of Window (1 = True/Bad)
+    CASE WHEN w_base.base_priority = 2 THEN 1 ELSE 0 END AS flag_weight_baseline_outside_window,
+    CASE WHEN bp_base.base_priority = 2 THEN 1 ELSE 0 END AS flag_bp_baseline_outside_window,
+    CASE WHEN a1c_base.base_priority = 2 THEN 1 ELSE 0 END AS flag_a1c_baseline_outside_window,
+
+    -- CALCULATIONS: Days Between Baseline and Current
+    DATEDIFF(w_curr.effective_date, w_base.effective_date) AS days_between_weight,
+    DATEDIFF(bp_curr.effective_date, bp_base.effective_date) AS days_between_bp,
+    DATEDIFF(a1c_curr.effective_date, a1c_base.effective_date) AS days_between_a1c,
 
     -- Flags
     CASE WHEN DATEDIFF(w_curr.effective_date, w_base.effective_date) >= 30 THEN 1 ELSE 0 END AS flag_weight_30days,
@@ -256,19 +287,22 @@ LEFT JOIN partner_employers pe ON u.user_id = pe.user_id
 INNER JOIN billable_stats_6mo bs ON u.user_id = bs.user_id AND bs.billable_months_last_6mo >= 6
 LEFT JOIN billable_stats_lifetime bl ON u.user_id = bl.user_id
 LEFT JOIN glp_stats gs ON u.user_id = gs.user_id
+LEFT JOIN hyperglycemic_meds hm ON u.user_id = hm.user_id -- NEW JOIN
 LEFT JOIN weight_compliance wc ON u.user_id = wc.user_id
 LEFT JOIN bp_compliance bpc ON u.user_id = bpc.user_id
 LEFT JOIN a1c_counts ac ON u.user_id = ac.user_id
-LEFT JOIN weight_ranks w_base ON u.user_id = w_base.user_id AND w_base.rn_asc = 1
-LEFT JOIN weight_ranks w_curr ON u.user_id = w_curr.user_id AND w_curr.rn_desc = 1
-LEFT JOIN bmi_ranks bmi_base ON u.user_id = bmi_base.user_id AND bmi_base.rn_asc = 1
-LEFT JOIN bmi_ranks bmi_curr ON u.user_id = bmi_curr.user_id AND bmi_curr.rn_desc = 1
-LEFT JOIN bp_ranks bp_base ON u.user_id = bp_base.user_id AND bp_base.rn_asc = 1
-LEFT JOIN bp_ranks bp_curr ON u.user_id = bp_curr.user_id AND bp_curr.rn_desc = 1
-LEFT JOIN a1c_ranks a1c_base ON u.user_id = a1c_base.user_id AND a1c_base.rn_asc = 1
-LEFT JOIN a1c_ranks a1c_curr ON u.user_id = a1c_curr.user_id AND a1c_curr.rn_desc = 1
-LEFT JOIN nps_latest nps ON u.user_id = nps.user_id AND nps.rn = 1
-LEFT JOIN csat_stats csat ON u.user_id = csat.user_id
+
+LEFT JOIN weight_ranks w_base ON u.user_id = w_base.user_id AND w_base.rn_base = 1
+LEFT JOIN weight_ranks w_curr ON u.user_id = w_curr.user_id AND w_curr.rn_curr = 1
+
+LEFT JOIN bmi_ranks bmi_base ON u.user_id = bmi_base.user_id AND bmi_base.rn_base = 1
+LEFT JOIN bmi_ranks bmi_curr ON u.user_id = bmi_curr.user_id AND bmi_curr.rn_curr = 1
+
+LEFT JOIN bp_ranks bp_base ON u.user_id = bp_base.user_id AND bp_base.rn_base = 1
+LEFT JOIN bp_ranks bp_curr ON u.user_id = bp_curr.user_id AND bp_curr.rn_curr = 1
+
+LEFT JOIN a1c_ranks a1c_base ON u.user_id = a1c_base.user_id AND a1c_base.rn_base = 1
+LEFT JOIN a1c_ranks a1c_curr ON u.user_id = a1c_curr.user_id AND a1c_curr.rn_curr = 1
 
 // Custom Sql 2 (Questionnaire responses)
 WITH 
