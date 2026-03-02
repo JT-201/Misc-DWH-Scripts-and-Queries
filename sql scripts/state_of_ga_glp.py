@@ -1310,5 +1310,919 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+
+
+
+
+
+
+# updated to match expiration PA file
+
+import mysql.connector
+import pandas as pd
+import numpy as np
+import time
+import sys
+import warnings
+from datetime import datetime, timedelta
+
+warnings.filterwarnings('ignore')
+
+try:
+    from config import get_db_config
+except ImportError:
+    print("❌ Error: Could not find 'config.py'.")
+    sys.exit(1)
+
+def connect_to_db():
+    config = get_db_config()
+    config['connect_timeout'] = 300
+    return mysql.connector.connect(**config)
+
+def get_data(conn, query, desc, chunk_size=50000):
+    start = time.time()
+    print(f"  📥 Fetching {desc}...")
+    try:
+        chunks = []
+        for chunk in pd.read_sql(query, conn, chunksize=chunk_size):
+            chunks.append(chunk)
+            sys.stdout.write(f"\r    ...loaded {sum(len(c) for c in chunks):,} rows")
+            sys.stdout.flush()
+        if chunks:
+            df = pd.concat(chunks, ignore_index=True)
+        else:
+            df = pd.DataFrame()
+        duration = time.time() - start
+        print(f"\n    ⏱️  Finished: {len(df):,} rows in {duration:.2f}s")
+        return df
+    except Exception as e:
+        print(f"\n    ❌ Critical Error fetching {desc}: {e}")
+        sys.exit(1)
+
+def run_georgia_glp1_query(conn):
+    print("\n  📥 Fetching Georgia GLP-1 members...")
+    start = time.time()
+    query = """
+        WITH
+
+        -- ─────────────────────────────────────────────
+        -- 1. CORE MEMBER SET: Georgia, active, GLP-1 interest
+        -- ─────────────────────────────────────────────
+        georgia_glp1_members AS (
+            SELECT
+                u.id                                        AS member_id,
+                u.readable_id,
+                u.primary_condition_group,
+                s.subscription_status,
+                s.subscription_start_date,
+                s.cancellation_date,
+                DATEDIFF(CURDATE(), s.subscription_start_date) AS days_enrolled
+
+            FROM users u
+
+            JOIN (
+                SELECT DISTINCT user_id
+                FROM partner_employers
+                WHERE name = 'State of Georgia'
+            ) pe ON pe.user_id = u.id
+
+            JOIN (
+                SELECT
+                    user_id,
+                    'ACTIVE'                                AS subscription_status,
+                    MIN(start_date)                         AS subscription_start_date,
+                    NULL                                    AS cancellation_date
+                FROM subscriptions
+                WHERE status = 'ACTIVE'
+                  AND cancellation_date IS NULL
+                GROUP BY user_id
+            ) s ON s.user_id = u.id
+
+            WHERE EXISTS (
+                SELECT 1
+                FROM questionnaire_records qr_interest
+                WHERE qr_interest.user_id = u.id
+                  AND qr_interest.question_id = 'A8z9j98E0sxR'
+                  AND qr_interest.answer_value = 1
+                  AND qr_interest.is_latest_answer = 1
+            )
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 2. MEMBER NAMES (for Tableau join to feb_march_expire)
+        -- ─────────────────────────────────────────────
+        member_names AS (
+            SELECT
+                user_id                                                         AS member_id,
+                UPPER(first_name)                                               AS first_name,
+                UPPER(last_name)                                                AS last_name,
+                UPPER(CONCAT(first_name, ' ', last_name))                       AS full_name_upper,
+                UPPER(default_shipping_address_street)                          AS shipping_street,
+                UPPER(default_shipping_address_city)                            AS shipping_city,
+                UPPER(default_shipping_address_state)                           AS shipping_state,
+                default_shipping_address_zip                                    AS shipping_zip
+            FROM nineamdwh_restricted.user_details
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 3. MEMBER-REPORTED MEDICATION NAME
+        -- ─────────────────────────────────────────────
+        member_reported_med AS (
+            SELECT
+                user_id                                     AS member_id,
+                answer_text                                 AS reported_medication_name
+            FROM questionnaire_records
+            WHERE question_id = 'knzp0ZppEBF4'
+              AND is_latest_answer = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 4. GLP-1 CONTINUATION QUESTIONNAIRE
+        --    answer value + date answered (no continue flag per request)
+        -- ─────────────────────────────────────────────
+        member_glp1_continuation AS (
+            SELECT
+                user_id                                     AS member_id,
+                answer_value                                AS glp1_continuation_answer,
+                answered_at                                 AS glp1_continuation_answered_at
+            FROM questionnaire_records
+            WHERE question_id = 'gV9Xu8RzF9hR'
+              AND is_latest_answer = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 5. ALL GLP-1 Rx (WM + DM) — used for latest AND first-ever
+        -- ─────────────────────────────────────────────
+        glp1_rx_all AS (
+            SELECT
+                p.patient_user_id                           AS member_id,
+                BIN_TO_UUID(p.id)                           AS prescription_id,
+                p.prescribed_ndc,
+                m.name                                       AS prescribed_medication_name,
+                m.therapy_type,
+                p.prescribed_at,
+                p.days_of_supply,
+                p.total_refills,
+                p.is_valid,
+                mdc.drug_class_name,
+                p.days_of_supply * (1 + COALESCE(p.total_refills, 0))
+                                                            AS total_covered_days,
+                DATE_ADD(
+                    p.prescribed_at,
+                    INTERVAL p.days_of_supply * (1 + COALESCE(p.total_refills, 0)) DAY
+                )                                           AS coverage_end_date,
+                CASE
+                    WHEN DATE_ADD(
+                        p.prescribed_at,
+                        INTERVAL p.days_of_supply * (1 + COALESCE(p.total_refills, 0)) DAY
+                    ) >= CURDATE()
+                    THEN 1 ELSE 0
+                END                                         AS rx_covers_today,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.patient_user_id
+                    ORDER BY p.prescribed_at DESC
+                )                                           AS rx_rank_latest,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.patient_user_id
+                    ORDER BY p.prescribed_at ASC
+                )                                           AS rx_rank_first
+            FROM prescriptions p
+            JOIN medication_dosage_ndcs mdn
+                ON mdn.ndc = p.prescribed_ndc
+            JOIN medication_dosages md
+                ON md.id = mdn.medication_dosage_id
+            JOIN medications m
+                ON m.id = md.medication_id
+            JOIN medication_drug_classes mdc
+                ON mdc.medication_id = m.id
+            WHERE mdc.drug_class_name = 'GLP1'
+              AND m.therapy_type IN ('WM', 'DM')
+        ),
+
+        -- Latest GLP-1 Rx per member
+        latest_glp1_rx AS (
+            SELECT *
+            FROM glp1_rx_all
+            WHERE rx_rank_latest = 1
+        ),
+
+        -- First-ever GLP-1 Rx per member (from 9am Health)
+        first_glp1_rx AS (
+            SELECT
+                member_id,
+                prescribed_at                               AS first_glp1_rx_date,
+                prescribed_medication_name                  AS first_glp1_rx_drug_name,
+                therapy_type                                AS first_glp1_rx_therapy_type
+            FROM glp1_rx_all
+            WHERE rx_rank_first = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 6. WM Rx since 2026-01-01 flag + details
+        -- ─────────────────────────────────────────────
+        wm_rx_2026 AS (
+            SELECT
+                p.patient_user_id                           AS member_id,
+                1                                           AS has_wm_rx_since_2026,
+                MIN(DATE(p.prescribed_at))                  AS first_wm_rx_2026_date,
+                -- Most recent WM Rx since 2026
+                MAX(DATE(p.prescribed_at))                  AS latest_wm_rx_2026_date
+            FROM prescriptions p
+            JOIN medication_dosage_ndcs mdn
+                ON mdn.ndc = p.prescribed_ndc
+            JOIN medication_dosages md
+                ON md.id = mdn.medication_dosage_id
+            JOIN medications m
+                ON m.id = md.medication_id
+            WHERE m.therapy_type = 'WM'
+              AND DATE(p.prescribed_at) >= '2026-01-01'
+            GROUP BY p.patient_user_id
+        ),
+
+        -- Latest WM Rx drug name (separate subquery to avoid fan-out)
+        latest_wm_rx_drug AS (
+            SELECT
+                p.patient_user_id                           AS member_id,
+                m.name                                      AS latest_wm_rx_drug_name,
+                m.therapy_type                              AS latest_wm_rx_therapy_type,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.patient_user_id
+                    ORDER BY p.prescribed_at DESC
+                )                                           AS rn
+            FROM prescriptions p
+            JOIN medication_dosage_ndcs mdn
+                ON mdn.ndc = p.prescribed_ndc
+            JOIN medication_dosages md
+                ON md.id = mdn.medication_dosage_id
+            JOIN medications m
+                ON m.id = md.medication_id
+            WHERE m.therapy_type = 'WM'
+              AND DATE(p.prescribed_at) >= '2026-01-01'
+        ),
+
+        latest_wm_rx AS (
+            SELECT member_id, latest_wm_rx_drug_name, latest_wm_rx_therapy_type
+            FROM latest_wm_rx_drug
+            WHERE rn = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 7. ANY OTHER Rx (non-GLP1, all time)
+        --    One row per member: flag + most recent non-GLP1 Rx details
+        -- ─────────────────────────────────────────────
+        non_glp1_rx_all AS (
+            SELECT
+                p.patient_user_id                           AS member_id,
+                m.name                                      AS rx_drug_name,
+                m.therapy_type                              AS rx_therapy_type,
+                mdc.drug_class_name                         AS rx_drug_class,
+                DATE(p.prescribed_at)                       AS rx_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.patient_user_id
+                    ORDER BY p.prescribed_at DESC
+                )                                           AS rn
+            FROM prescriptions p
+            JOIN medication_dosage_ndcs mdn
+                ON mdn.ndc = p.prescribed_ndc
+            JOIN medication_dosages md
+                ON md.id = mdn.medication_dosage_id
+            JOIN medications m
+                ON m.id = md.medication_id
+            JOIN medication_drug_classes mdc
+                ON mdc.medication_id = m.id
+            WHERE mdc.drug_class_name != 'GLP1'
+        ),
+
+        other_rx_summary AS (
+            SELECT
+                member_id,
+                1                                           AS has_other_non_glp1_rx,
+                -- Most recent non-GLP1 Rx
+                MAX(CASE WHEN rn = 1 THEN rx_drug_name     END) AS other_rx_latest_drug_name,
+                MAX(CASE WHEN rn = 1 THEN rx_drug_class    END) AS other_rx_latest_drug_class,
+                MAX(CASE WHEN rn = 1 THEN rx_therapy_type  END) AS other_rx_latest_therapy_type,
+                MAX(CASE WHEN rn = 1 THEN rx_date          END) AS other_rx_latest_date,
+                COUNT(*)                                    AS other_rx_total_count
+            FROM non_glp1_rx_all
+            GROUP BY member_id
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 8. BASELINE WEIGHT
+        -- ─────────────────────────────────────────────
+        baseline_weight AS (
+            SELECT
+                user_id                                     AS member_id,
+                ROUND(value * 2.20462, 2)                   AS baseline_weight_lbs,
+                effective_date                              AS baseline_weight_date
+            FROM (
+                SELECT
+                    bwv.user_id,
+                    bwv.value,
+                    bwv.effective_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bwv.user_id
+                        ORDER BY bwv.effective_date ASC
+                    )                                       AS rn
+                FROM body_weight_values_cleaned bwv
+                JOIN georgia_glp1_members g
+                    ON g.member_id = bwv.user_id
+                WHERE bwv.value IS NOT NULL
+                  AND bwv.effective_date >= DATE_SUB(g.subscription_start_date, INTERVAL 30 DAY)
+            ) ranked
+            WHERE rn = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 9. DOSES REMAINING
+        -- ─────────────────────────────────────────────
+        member_doses_remaining AS (
+            SELECT
+                user_id                                         AS member_id,
+                answer_value                                    AS doses_remaining_at_survey,
+                answered_at                                     AS doses_question_answered_at,
+                DATEDIFF(CURDATE(), answered_at)                AS days_since_answered,
+                FLOOR(DATEDIFF(CURDATE(), answered_at) / 7)     AS weeks_since_answered,
+                GREATEST(
+                    answer_value - FLOOR(DATEDIFF(CURDATE(), answered_at) / 7),
+                    0
+                )                                               AS estimated_doses_remaining_today,
+                CASE
+                    WHEN answer_value = 0
+                        THEN 1
+                    WHEN answer_value - FLOOR(DATEDIFF(CURDATE(), answered_at) / 7) <= 0
+                        THEN 1
+                    ELSE 0
+                END                                             AS likely_missed_dose
+            FROM questionnaire_records
+            WHERE question_id = 'UUeznpkuACcR'
+              AND is_latest_answer = 1
+        ),
+
+        -- ─────────────────────────────────────────────
+        -- 10. FINAL ASSEMBLY
+        -- ─────────────────────────────────────────────
+        final AS (
+            SELECT
+                -- Identifiers & names
+                g.member_id,
+                g.readable_id,
+                nm.first_name,
+                nm.last_name,
+                nm.full_name_upper,
+                nm.shipping_street,
+                nm.shipping_city,
+                nm.shipping_state,
+                nm.shipping_zip,
+
+                -- Subscription info
+                g.subscription_status,
+                g.subscription_start_date,
+                g.cancellation_date,
+                g.days_enrolled,
+                g.primary_condition_group,
+
+                -- GLP-1 continuation questionnaire
+                cont.glp1_continuation_answer,
+                cont.glp1_continuation_answered_at,
+
+                -- Reported medication
+                rm.reported_medication_name,
+
+                -- Baseline weight
+                bw.baseline_weight_lbs,
+                bw.baseline_weight_date,
+
+                -- Latest GLP-1 Rx details
+                rx.prescription_id,
+                rx.prescribed_at,
+                rx.days_of_supply,
+                rx.total_refills,
+                rx.total_covered_days,
+                rx.coverage_end_date,
+                rx.rx_covers_today,
+                rx.is_valid,
+                rx.drug_class_name,
+                rx.therapy_type,
+                rx.prescribed_medication_name,
+
+                -- First-ever GLP-1 Rx from 9am Health
+                first_rx.first_glp1_rx_date,
+                first_rx.first_glp1_rx_drug_name,
+                first_rx.first_glp1_rx_therapy_type,
+
+                -- WM Rx since 2026 flag + details
+                COALESCE(wm.has_wm_rx_since_2026, 0)       AS has_wm_rx_since_2026,
+                wm.first_wm_rx_2026_date,
+                wm.latest_wm_rx_2026_date,
+                lwm.latest_wm_rx_drug_name,
+                lwm.latest_wm_rx_therapy_type,
+
+                -- Non-GLP1 Rx flag + latest details
+                COALESCE(orx.has_other_non_glp1_rx, 0)     AS has_other_non_glp1_rx,
+                orx.other_rx_total_count,
+                orx.other_rx_latest_drug_name,
+                orx.other_rx_latest_drug_class,
+                orx.other_rx_latest_therapy_type,
+                orx.other_rx_latest_date,
+
+                -- Doses remaining
+                dr.doses_remaining_at_survey,
+                dr.doses_question_answered_at,
+                dr.days_since_answered,
+                dr.weeks_since_answered,
+                dr.estimated_doses_remaining_today,
+                dr.likely_missed_dose,
+
+                -- Member category
+                CASE
+                    WHEN cont.glp1_continuation_answer = 0
+                        THEN 'Opted Out of GLP-1'
+                    WHEN rx.prescription_id IS NULL
+                     AND g.days_enrolled < 30
+                        THEN 'New Enrollee - No Rx Yet'
+                    WHEN rx.prescription_id IS NULL
+                        THEN 'Not Prescribed GLP-1'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND DATE(rx.prescribed_at) = CURDATE()
+                     AND TIME(NOW()) < '09:00:00'
+                        THEN 'Rx Written - Not Yet Sent to Pharmacy'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND g.days_enrolled < 30
+                     AND rx.rx_covers_today = 1
+                        THEN 'Active GLP-1 Rx - Covered Through Today'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND g.days_enrolled < 30
+                     AND rx.rx_covers_today = 0
+                     AND DATEDIFF(CURDATE(), rx.coverage_end_date) <= 30
+                        THEN 'Active GLP-1 Rx - Covered Through Today'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND g.days_enrolled < 30
+                        THEN 'New Enrollee - Rx Lapsed'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND rx.rx_covers_today = 1
+                        THEN 'Active GLP-1 Rx - Covered Through Today'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND rx.rx_covers_today = 0
+                     AND DATEDIFF(CURDATE(), rx.coverage_end_date) <= 30
+                        THEN 'Active GLP-1 Rx - Covered Through Today'
+                    WHEN rx.prescription_id IS NOT NULL
+                     AND rx.rx_covers_today = 0
+                        THEN 'GLP-1 Rx Lapsed - Coverage Expired'
+                    ELSE 'Uncategorized'
+                END                                             AS member_category
+
+            FROM georgia_glp1_members g
+            LEFT JOIN member_names              nm      ON nm.member_id      = g.member_id
+            LEFT JOIN member_reported_med       rm      ON rm.member_id      = g.member_id
+            LEFT JOIN member_glp1_continuation  cont    ON cont.member_id    = g.member_id
+            LEFT JOIN latest_glp1_rx            rx      ON rx.member_id      = g.member_id
+            LEFT JOIN first_glp1_rx             first_rx ON first_rx.member_id = g.member_id
+            LEFT JOIN wm_rx_2026                wm      ON wm.member_id      = g.member_id
+            LEFT JOIN latest_wm_rx              lwm     ON lwm.member_id     = g.member_id
+            LEFT JOIN other_rx_summary          orx     ON orx.member_id     = g.member_id
+            LEFT JOIN baseline_weight           bw      ON bw.member_id      = g.member_id
+            LEFT JOIN member_doses_remaining    dr      ON dr.member_id      = g.member_id
+        )
+
+        SELECT
+            -- Identifiers & names
+            member_id,
+            readable_id,
+            first_name,
+            last_name,
+            full_name_upper,
+            shipping_street,
+            shipping_city,
+            shipping_state,
+            shipping_zip,
+
+            -- Subscription
+            subscription_status,
+            subscription_start_date,
+            cancellation_date,
+            days_enrolled,
+            primary_condition_group,
+
+            -- GLP-1 continuation questionnaire
+            glp1_continuation_answer,
+            glp1_continuation_answered_at,
+
+            -- Reported med
+            reported_medication_name,
+
+            -- Baseline weight
+            baseline_weight_lbs,
+            baseline_weight_date,
+
+            -- Latest GLP-1 Rx
+            prescription_id,
+            prescribed_at,
+            days_of_supply,
+            total_refills,
+            total_covered_days,
+            coverage_end_date,
+            rx_covers_today,
+            is_valid,
+            drug_class_name,
+            therapy_type,
+            prescribed_medication_name,
+
+            -- First GLP-1 Rx from 9am Health
+            first_glp1_rx_date,
+            first_glp1_rx_drug_name,
+            first_glp1_rx_therapy_type,
+
+            -- WM Rx
+            has_wm_rx_since_2026,
+            first_wm_rx_2026_date,
+            latest_wm_rx_2026_date,
+            latest_wm_rx_drug_name,
+            latest_wm_rx_therapy_type,
+
+            -- Other non-GLP1 Rx
+            has_other_non_glp1_rx,
+            other_rx_total_count,
+            other_rx_latest_drug_name,
+            other_rx_latest_drug_class,
+            other_rx_latest_therapy_type,
+            other_rx_latest_date,
+
+            -- Doses
+            doses_remaining_at_survey,
+            doses_question_answered_at,
+            days_since_answered,
+            weeks_since_answered,
+            estimated_doses_remaining_today,
+            likely_missed_dose,
+
+            -- Category
+            member_category
+
+        FROM final
+        ORDER BY member_category, days_enrolled DESC
+    """
+    df = get_data(conn, query, "Georgia GLP-1 members")
+    duration = time.time() - start
+    print(f"  ⏱️  Total query time: {duration:.2f}s")
+    print(f"  🔍 Columns returned: {df.columns.tolist()}")
+    print(f"  🔍 prescribed_medication_name sample: {df['prescribed_medication_name'].value_counts(dropna=False).head(5).to_dict() if 'prescribed_medication_name' in df.columns else 'COLUMN MISSING'}")
+    print(f"  🔍 has_wm_rx_since_2026 distribution: {df['has_wm_rx_since_2026'].value_counts(dropna=False).to_dict() if 'has_wm_rx_since_2026' in df.columns else 'COLUMN MISSING'}")
+    print(f"  🔍 has_other_non_glp1_rx distribution: {df['has_other_non_glp1_rx'].value_counts(dropna=False).to_dict() if 'has_other_non_glp1_rx' in df.columns else 'COLUMN MISSING'}")
+    print(f"  🔍 first_glp1_rx_date sample: {df['first_glp1_rx_date'].dropna().head(5).tolist() if 'first_glp1_rx_date' in df.columns else 'COLUMN MISSING'}")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASKS CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+TASKS = [
+    {
+        'slug'         : 'glp1-continuation-questionnaire',
+        'col_prefix'   : 'task_glp1_questionnaire',
+        'required_for' : 'all',
+        'description'  : 'Continuation questionnaire',
+    },
+    {
+        'slug'         : 'upload-prescription-label',
+        'col_prefix'   : 'task_rx_label',
+        'required_for' : 'all',
+        'description'  : 'Upload prescription label image',
+    },
+    {
+        'slug'         : 'pharmacy-insurance',
+        'col_prefix'   : 'task_pharmacy_insurance',
+        'required_for' : 'all',
+        'description'  : 'Pharmacy insurance info',
+    },
+    {
+        'slug'         : 'complete-initial-lab-order',
+        'col_prefix'   : 'task_lab_order',
+        'required_for' : 'all',
+        'description'  : 'Complete initial lab order',
+    },
+    {
+        'slug'         : 'upload-proof-of-weight',
+        'col_prefix'   : 'task_weight_proof',
+        'required_for' : 'non_diabetes',
+        'description'  : 'Upload proof of weight documentation',
+    },
+    {
+        'slug'         : 'preferred-pharmacy',
+        'col_prefix'   : 'task_preferred_pharmacy',
+        'required_for' : 'conditional',
+        'description'  : 'Select preferred pharmacy (if applicable)',
+    },
+]
+
+for t in TASKS:
+    t['status_col']    = f"{t['col_prefix']}_status"
+    t['started_col']   = f"{t['col_prefix']}_started_at"
+    t['completed_col'] = f"{t['col_prefix']}_completed_at"
+
+TASK_SLUGS    = [t['slug']     for t in TASKS]
+ALL_TASK_COLS = [c for t in TASKS for c in [t['status_col'], t['started_col'], t['completed_col']]]
+
+
+def run_task_analysis(conn, member_ids):
+    if not member_ids:
+        print("  ⚠️  No member IDs passed to task analysis — skipping.")
+        return pd.DataFrame()
+
+    print(f"\n  📥 Fetching task progress for {len(member_ids):,} unprescribed members...")
+    start = time.time()
+
+    placeholders = ", ".join(["%s"] * len(member_ids))
+    slug_list    = ", ".join([f"'{s}'" for s in TASK_SLUGS])
+
+    case_blocks = []
+    for t in TASKS:
+        p = t['col_prefix']
+        s = t['slug']
+        case_blocks.append(f"""
+            MAX(CASE WHEN t.slug = '{s}' THEN t.status       END) AS {p}_status,
+            MAX(CASE WHEN t.slug = '{s}' THEN t.started_at   END) AS {p}_started_at,
+            MAX(CASE WHEN t.slug = '{s}' THEN t.completed_at END) AS {p}_completed_at""")
+
+    cases = ",".join(case_blocks)
+
+    query = f"""
+        SELECT
+            t.user_id AS member_id,
+            {cases}
+        FROM tasks t
+        WHERE t.user_id IN ({placeholders})
+          AND t.slug IN ({slug_list})
+        GROUP BY t.user_id
+    """
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, member_ids)
+        rows = cursor.fetchall()
+        cursor.close()
+        task_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        duration = time.time() - start
+        print(f"    ⏱️  Task query finished: {len(task_df):,} members with task records in {duration:.2f}s")
+        return task_df
+    except Exception as e:
+        print(f"\n    ❌ Error fetching task data: {e}")
+        return pd.DataFrame()
+
+
+def merge_tasks_into_cohort(cohort_df, task_df):
+    if task_df.empty:
+        for col in ALL_TASK_COLS:
+            cohort_df[col] = None
+        return cohort_df
+    return cohort_df.merge(task_df, on='member_id', how='left')
+
+
+def add_task_summary_columns(df):
+    df = df.copy()
+
+    DIABETES_CONDITIONS = {'type 2 diabetes', 'diabetes', 'dm', 't2d'}
+    df['_is_diabetes'] = df['primary_condition_group'].str.lower().str.strip().isin(DIABETES_CONDITIONS)
+
+    def _summarise(row):
+        required = []
+        for t in TASKS:
+            if t['required_for'] == 'all':
+                required.append(t)
+            elif t['required_for'] == 'non_diabetes' and not row['_is_diabetes']:
+                required.append(t)
+
+        total_required  = len(required)
+        completed_tasks = [t for t in required if str(row.get(t['status_col'], '')).upper() == 'COMPLETED']
+        incomplete      = [t['slug'] for t in required if str(row.get(t['status_col'], '')).upper() != 'COMPLETED']
+
+        return pd.Series({
+            'tasks_required_for_member' : total_required,
+            'tasks_completed_count'     : len(completed_tasks),
+            'tasks_incomplete'          : ', '.join(incomplete) if incomplete else 'none',
+            'all_required_tasks_done'   : 1 if len(completed_tasks) >= total_required else 0,
+        })
+
+    summary_cols = df.apply(_summarise, axis=1)
+    df = pd.concat([df, summary_cols], axis=1)
+    df.drop(columns=['_is_diabetes'], inplace=True)
+    return df
+
+
+def build_task_status_summary(cohort_df):
+    rows = []
+    for t in TASKS:
+        col = t['status_col']
+        if col not in cohort_df.columns:
+            continue
+        counts = (
+            cohort_df[col]
+            .fillna('NO TASK RECORD')
+            .value_counts()
+            .reset_index()
+        )
+        counts.columns = ['status', 'member_count']
+        counts.insert(0, 'required_for', t['required_for'])
+        counts.insert(0, 'description',  t['description'])
+        counts.insert(0, 'task_slug',    t['slug'])
+        rows.append(counts)
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def build_incomplete_task_summary(cohort_df):
+    DIABETES_CONDITIONS = {'type 2 diabetes', 'diabetes', 'dm', 't2d'}
+    rows = []
+
+    for t in TASKS:
+        if t['required_for'] == 'conditional':
+            continue
+
+        col = t['status_col']
+        if col not in cohort_df.columns:
+            continue
+
+        if t['required_for'] == 'non_diabetes':
+            subset = cohort_df[
+                ~cohort_df['primary_condition_group'].str.lower().str.strip().isin(DIABETES_CONDITIONS)
+            ]
+        else:
+            subset = cohort_df
+
+        not_done = subset[subset[col].fillna('').str.upper() != 'COMPLETED']
+        if not_done.empty:
+            continue
+
+        counts = (
+            not_done[col]
+            .fillna('NO TASK RECORD')
+            .value_counts()
+            .reset_index()
+        )
+        counts.columns = ['status', 'member_count']
+        counts.insert(0, 'required_for', t['required_for'])
+        counts.insert(0, 'description',  t['description'])
+        counts.insert(0, 'task_slug',    t['slug'])
+        rows.append(counts)
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_to_excel(df, not_prescribed_df=None):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename  = f"georgia_glp1_members_{timestamp}.xlsx"
+    print(f"\n  📤 Exporting to {filename}...")
+
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+
+        df.to_excel(writer, sheet_name="All Members", index=False)
+        print(f"  ✅ All Members: {len(df):,} rows")
+
+        for category in sorted(df["member_category"].unique()):
+            sheet_df   = df[df["member_category"] == category]
+            sheet_name = category[:31]
+            sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"  ✅ {category}: {len(sheet_df):,} members")
+
+        if not_prescribed_df is not None and not not_prescribed_df.empty:
+
+            not_prescribed_df.to_excel(
+                writer, sheet_name="Not Prescribed - Task Detail", index=False
+            )
+            print(f"  ✅ Not Prescribed - Task Detail: {len(not_prescribed_df):,} members")
+
+            status_summary = build_task_status_summary(not_prescribed_df)
+            if not status_summary.empty:
+                status_summary.to_excel(
+                    writer, sheet_name="Not Prescribed - Task Summary", index=False
+                )
+                print(f"  ✅ Not Prescribed - Task Summary: written")
+
+            incomplete_summary = build_incomplete_task_summary(not_prescribed_df)
+            if not incomplete_summary.empty:
+                incomplete_summary.to_excel(
+                    writer, sheet_name="Not Prescribed - Blockers", index=False
+                )
+                print(f"  ✅ Not Prescribed - Blockers: written")
+
+            dose_cols = [
+                'member_id', 'readable_id', 'first_name', 'last_name', 'full_name_upper',
+                'days_enrolled', 'member_category',
+                'doses_remaining_at_survey', 'doses_question_answered_at',
+                'days_since_answered', 'weeks_since_answered',
+                'estimated_doses_remaining_today', 'likely_missed_dose',
+            ]
+            dose_cols_present = [c for c in dose_cols if c in not_prescribed_df.columns]
+            dose_df = not_prescribed_df[dose_cols_present].copy()
+
+            dose_df_answered = dose_df[dose_df['doses_remaining_at_survey'].notna()].copy()
+            dose_df_answered = dose_df_answered.sort_values(
+                ['likely_missed_dose', 'estimated_doses_remaining_today'],
+                ascending=[False, True]
+            )
+            dose_df_answered.to_excel(
+                writer, sheet_name="Not Prescribed - Dose Data", index=False
+            )
+            print(f"  ✅ Not Prescribed - Dose Data: {len(dose_df_answered):,} members who answered")
+
+    print(f"\n✅ Exported to {filename}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("🚀 Starting Georgia GLP-1 Member Analysis")
+    print(f"   Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    try:
+        conn = connect_to_db()
+        print("  ✅ Connected to DB")
+    except Exception as e:
+        print(f"  ❌ Failed to connect to DB: {e}")
+        sys.exit(1)
+
+    df = run_georgia_glp1_query(conn)
+
+    if df.empty:
+        print("⚠️  No results returned. Check question IDs and partner employer name.")
+        conn.close()
+        sys.exit(0)
+
+    print(f"\n📊 Member category breakdown:")
+    print(df["member_category"].value_counts().to_string())
+
+    if 'has_wm_rx_since_2026' in df.columns:
+        wm_count = int(df['has_wm_rx_since_2026'].sum())
+        print(f"\n📊 Members with any WM Rx since 2026-01-01: {wm_count:,} of {len(df):,}")
+
+    if 'has_other_non_glp1_rx' in df.columns:
+        other_count = int(df['has_other_non_glp1_rx'].sum())
+        print(f"📊 Members with any non-GLP1 Rx ever:      {other_count:,} of {len(df):,}")
+
+    if 'first_name' in df.columns:
+        missing_names = df['first_name'].isna().sum()
+        print(f"📊 Members with name resolved:             {len(df) - missing_names:,} of {len(df):,}")
+
+    NO_RX_CATEGORIES = {"Not Prescribed GLP-1", "New Enrollee - No Rx Yet"}
+    not_prescribed_df = df[df["member_category"].isin(NO_RX_CATEGORIES)].copy()
+    print(f"\n  → {len(not_prescribed_df):,} members with no 9amhealth GLP-1 Rx")
+
+    if not not_prescribed_df.empty:
+        member_ids        = not_prescribed_df["member_id"].tolist()
+        task_df           = run_task_analysis(conn, member_ids)
+        not_prescribed_df = merge_tasks_into_cohort(not_prescribed_df, task_df)
+        not_prescribed_df = add_task_summary_columns(not_prescribed_df)
+
+        print(f"\n📊 Required task completion breakdown:")
+        print(not_prescribed_df["tasks_completed_count"].value_counts().sort_index().to_string())
+
+        print(f"\n  All required tasks done (awaiting Rx): "
+              f"{not_prescribed_df['all_required_tasks_done'].sum():,}")
+
+        print(f"\n📊 Task status breakdown (per slug):")
+        for t in TASKS:
+            col = t['status_col']
+            if col in not_prescribed_df.columns:
+                print(f"\n  {t['slug']} ({t['required_for']}):")
+                print(
+                    not_prescribed_df[col]
+                    .fillna('NO TASK RECORD')
+                    .value_counts()
+                    .to_string()
+                )
+
+        if 'likely_missed_dose' in not_prescribed_df.columns:
+            answered  = not_prescribed_df['likely_missed_dose'].notna().sum()
+            if answered > 0:
+                missed    = int(not_prescribed_df['likely_missed_dose'].sum())
+                no_data   = not_prescribed_df['likely_missed_dose'].isna().sum()
+                still_has = answered - missed
+                print(f"\n📊 Missed dose estimate (no-Rx members who answered the question):")
+                print(f"   Answered the question:        {answered:,} of {len(not_prescribed_df):,}")
+                print(f"   Likely missed a dose:         {missed:,}  ({missed/answered*100:.1f}% of those who answered)")
+                print(f"   Still have doses remaining:   {still_has:,}  ({still_has/answered*100:.1f}% of those who answered)")
+                print(f"   No questionnaire answer:      {no_data:,}")
+
+    else:
+        print("  ⚠️  No unprescribed members found — task sheets will be skipped.")
+        not_prescribed_df = None
+
+    conn.close()
+
+    export_to_excel(df, not_prescribed_df)
+
+
+if __name__ == "__main__":
+    main()
+
 if __name__ == "__main__":
     main()
