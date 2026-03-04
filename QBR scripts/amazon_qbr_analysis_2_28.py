@@ -18,7 +18,7 @@ def execute_with_timing(cursor, query, description):
     print(f"    ⏱️  {description}: {duration:.2f}s")
     return duration
 
-def create_amazon_user_tables(cursor, end_date='2026-01-01'):
+def create_amazon_user_tables(cursor, end_date='2025-10-01'):
     """Create Amazon user tables"""
     print(f"\n📦 Creating Amazon user tables (as of {end_date})...")
     
@@ -37,7 +37,7 @@ def create_amazon_user_tables(cursor, end_date='2026-01-01'):
     # Create index
     execute_with_timing(cursor, "CREATE INDEX idx_tmp_amazon_users_all_user_id ON tmp_amazon_users_all(user_id)", "Index Amazon users table")
 
-def create_amazon_users_6month_retention_table(cursor, end_date='2026-01-01'):
+def create_amazon_users_6month_retention_table(cursor, end_date='2025-10-01'):
     """Create temporary table for 6-month retention users using consecutive engagement logic"""
     print(f"\n🏥 Creating Amazon 6-month retention users table...")
     
@@ -116,7 +116,7 @@ def create_amazon_users_6month_retention_table(cursor, end_date='2026-01-01'):
         retention_rate = (retained_count / all_count * 100)
         print(f"  📊 Retention rate: {retention_rate:.1f}%")
 
-def create_amazon_glp1_tables(cursor, end_date='2026-01-01', coverage_gap_days=1):
+def create_amazon_glp1_tables(cursor, end_date='2025-10-01', coverage_gap_days=1):
     """Create GLP1 user tables for Amazon users"""
     print(f"\n💊 Creating Amazon GLP1 user tables (coverage through {end_date} ± {coverage_gap_days} days)...")
     
@@ -133,9 +133,8 @@ def create_amazon_glp1_tables(cursor, end_date='2026-01-01', coverage_gap_days=1
                 DATE_ADD(p.prescribed_at, INTERVAL (p.days_of_supply + p.days_of_supply * COALESCE(p.total_refills, 0)) DAY) as prescription_end_date
             FROM tmp_amazon_users_6month au  -- 6-MONTH RETENTION USERS
             JOIN prescriptions p ON au.user_id = p.patient_user_id
-            JOIN medication_dosage_ndcs ndcs ON p.prescribed_ndc = ndcs.ndc
-            JOIN medication_dosages ms on ms.id = ndcs.medication_dosage_id
-            JOIN medications m ON m.id = ms.medication_id
+            JOIN medication_ndcs ndcs ON p.prescribed_ndc = ndcs.ndc
+            JOIN medications m ON m.id = ndcs.medication_id
             WHERE (m.name LIKE '%Wegovy%' OR m.name LIKE '%Zepbound%')
             AND p.prescribed_at <= '{end_date}'  -- Only include prescriptions that start before end_date
         ),
@@ -170,7 +169,7 @@ def create_amazon_glp1_tables(cursor, end_date='2026-01-01', coverage_gap_days=1
     
     execute_with_timing(cursor, "CREATE INDEX idx_amazon_glp1_all_user_id ON tmp_amazon_glp1_users_all(user_id)", "Index Amazon GLP1 table")
 
-def create_weight_metrics_tables(cursor, end_date='2026-01-01'):
+def create_weight_metrics_tables(cursor, end_date='2025-10-01'):
     """Create weight metrics tables for Amazon users using 6-month retention users"""
     print(f"\n⚖️ Creating weight metrics tables (6-month retention users for health metrics)...")
     
@@ -197,26 +196,6 @@ def create_weight_metrics_tables(cursor, end_date='2026-01-01'):
         FROM ranked_weights WHERE rn = 1
     """, "Create baseline weight table")
 
-    # Baseline BMI table
-    execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_baseline_bmi_all", "Drop baseline BMI table")
-    execute_with_timing(cursor, f"""
-        CREATE TEMPORARY TABLE tmp_baseline_bmi_all AS
-        WITH ranked_bmi AS (
-            SELECT 
-                bmi.user_id,
-                bmi.value as bmi,
-                bmi.effective_date,
-                ROW_NUMBER() OVER (PARTITION BY bmi.user_id ORDER BY bmi.effective_date ASC) as rn
-            FROM bmi_values_cleaned bmi
-            JOIN {user_table} au ON bmi.user_id = au.user_id
-            WHERE bmi.value IS NOT NULL
-              AND bmi.effective_date >= DATE_SUB(au.start_date, INTERVAL 30 DAY)
-              AND bmi.effective_date <= '{end_date}'
-        )
-        SELECT user_id, bmi as baseline_bmi, effective_date as baseline_bmi_date
-        FROM ranked_bmi WHERE rn = 1
-    """, "Create baseline BMI table")
-
     # Latest weights from body_weight_values_cleaned
     execute_with_timing(cursor, "DROP TEMPORARY TABLE IF EXISTS tmp_latest_weight_all", "Drop latest weight table")
     execute_with_timing(cursor, f"""
@@ -241,7 +220,7 @@ def create_weight_metrics_tables(cursor, end_date='2026-01-01'):
     execute_with_timing(cursor, "CREATE INDEX idx_baseline_weight_all_user_id ON tmp_baseline_weight_all(user_id)", "Index baseline weight table")
     execute_with_timing(cursor, "CREATE INDEX idx_latest_weight_all_user_id ON tmp_latest_weight_all(user_id)", "Index latest weight table")
 
-def create_blood_pressure_tables(cursor, end_date='2026-01-01'):
+def create_blood_pressure_tables(cursor, end_date='2025-10-01'):
     """Create blood pressure tables for Amazon users"""
     print(f"\n🩺 Creating blood pressure tables...")
     
@@ -295,7 +274,7 @@ def create_blood_pressure_tables(cursor, end_date='2026-01-01'):
     execute_with_timing(cursor, "CREATE INDEX idx_baseline_bp_all_user_id ON tmp_baseline_blood_pressure_all(user_id)", "Index baseline BP table")
     execute_with_timing(cursor, "CREATE INDEX idx_latest_bp_all_user_id ON tmp_latest_blood_pressure_all(user_id)", "Index latest BP table")
 
-def create_a1c_metrics_tables(cursor, end_date='2026-01-01'):
+def create_a1c_metrics_tables(cursor, end_date='2025-10-01'):
     """Create A1C metrics tables for Amazon users"""
     print(f"\n🩺 Creating A1C metrics tables...")
     
@@ -358,9 +337,8 @@ def create_amazon_no_glp1_tables(cursor):
         LEFT JOIN (
             SELECT DISTINCT p.patient_user_id AS user_id
             FROM prescriptions p
-            JOIN medication_dosage_ndcs ndcs ON p.prescribed_ndc = ndcs.ndc
-            JOIN medication_dosages ms on ms.id = ndcs.medication_dosage_id
-            JOIN medications m ON m.id = ms.medication_id
+            JOIN medication_ndcs ndcs ON p.prescribed_ndc = ndcs.ndc
+            JOIN medications m ON m.id = ndcs.medication_id
             WHERE m.name LIKE '%Wegovy%' OR m.name LIKE '%Zepbound%'
         ) glp1_any ON au.user_id = glp1_any.user_id
         WHERE glp1_any.user_id IS NULL
@@ -511,11 +489,9 @@ def create_weight_loss_analysis(cursor):
                 ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 5 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_5_percent,
                 ROUND((COUNT(DISTINCT CASE WHEN hos.weight_loss_pct >= 10 THEN hos.user_id END) * 100.0 / COUNT(DISTINCT hos.user_id)), 2) as percent_achieving_10_percent
             FROM tmp_health_outcomes_summary hos
-            JOIN tmp_baseline_bmi_all bmi ON hos.user_id = bmi.user_id
             {join_where_clause}
             AND hos.baseline_weight_lbs IS NOT NULL 
             AND hos.latest_weight_lbs IS NOT NULL
-            AND bmi.baseline_bmi >= 30
         """
         
         execute_with_timing(cursor, base_query, f"Insert {group_name} analysis")
@@ -587,7 +563,7 @@ def create_blood_pressure_analysis(cursor):
         
         execute_with_timing(cursor, bp_query, f"Insert {group_name} BP analysis")
 
-def create_a1c_analysis(cursor, end_date='2026-01-01'):
+def create_a1c_analysis(cursor, end_date='2025-10-01'):
     """Create comprehensive A1C analysis with Corporate/Ops breakdowns"""
     print(f"\n🩺 Creating A1C analysis...")
     
@@ -615,25 +591,23 @@ def create_a1c_analysis(cursor, end_date='2026-01-01'):
     
     # Define A1C groups - FIXED  
     a1c_groups = [
-        ('All Users', ''),
+        ('All Users', ''),  # No filter - all users with A1C data
         ('Corporate', "JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id WHERE amm.job_category = 'Corporate'"),
         ('Ops', "JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id WHERE amm.job_category = 'Ops'"),
-        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id'),
+        ('GLP1 Users', 'JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id'),  # All GLP1 users
         ('Corporate GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id 
-                                JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
-                                WHERE amm.job_category = 'Corporate'"""),
+                                   JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
+                                   WHERE amm.job_category = 'Corporate'"""),
         ('Ops GLP1 Users', """JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id 
-                            JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
-                            WHERE amm.job_category = 'Ops'"""),
+                              JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
+                              WHERE amm.job_category = 'Ops'"""),
         ('No GLP1 Users', 'LEFT JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id WHERE glp.user_id IS NULL'),
         ('Corporate No GLP1 Users', """LEFT JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id 
-                                    JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
-                                    WHERE glp.user_id IS NULL AND amm.job_category = 'Corporate'"""),
+                                      JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
+                                      WHERE glp.user_id IS NULL AND amm.job_category = 'Corporate'"""),
         ('Ops No GLP1 Users', """LEFT JOIN tmp_amazon_glp1_users_all glp ON ba1c.user_id = glp.user_id 
-                                JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
-                                WHERE glp.user_id IS NULL AND amm.job_category = 'Ops'"""),
-        # Add this group for all above 5.7%
-        ('A1C ≥ 5.7%', "WHERE ba1c.baseline_a1c >= 5.7")
+                                 JOIN tmp_amazon_members_mapping amm ON ba1c.user_id = amm.user_id 
+                                 WHERE glp.user_id IS NULL AND amm.job_category = 'Ops'""")
     ]
     
     # Generate queries for all A1C groups
@@ -645,13 +619,13 @@ def create_a1c_analysis(cursor, end_date='2026-01-01'):
                 'All Users' as time_period,
                 '{group_name}' as user_group,
                 COUNT(DISTINCT ba1c.user_id) as total_users_with_data,
-                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 5.7 AND ba1c.baseline_a1c < 6.5 THEN ba1c.user_id END) as prediabetic_users,
-                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 6.5 THEN ba1c.user_id END) as diabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 5.7 THEN ba1c.user_id END) as prediabetic_users,
+                COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 6.5 AND ba1c.baseline_a1c < 7.0 THEN ba1c.user_id END) as diabetic_users,
                 COUNT(DISTINCT CASE WHEN ba1c.baseline_a1c >= 7.0 THEN ba1c.user_id END) as uncontrolled_diabetic_users,
                 ROUND(AVG(ba1c.baseline_a1c), 2) as avg_baseline_a1c,
                 ROUND(AVG(la1c.latest_a1c), 2) as avg_latest_a1c,
                 ROUND(AVG(ba1c.baseline_a1c - la1c.latest_a1c), 2) as avg_a1c_improvement,
-                ROUND(AVG(CASE WHEN ba1c.baseline_a1c >= 5.7 AND ba1c.baseline_a1c < 6.5 THEN ba1c.baseline_a1c - la1c.latest_a1c END), 2) as prediabetic_avg_improvement,
+                ROUND(AVG(CASE WHEN ba1c.baseline_a1c >= 5.7 THEN ba1c.baseline_a1c - la1c.latest_a1c END), 2) as prediabetic_avg_improvement,
                 ROUND(AVG(CASE WHEN ba1c.baseline_a1c >= 6.5 AND ba1c.baseline_a1c < 7.0 THEN ba1c.baseline_a1c - la1c.latest_a1c END), 2) as diabetic_avg_improvement,
                 ROUND(AVG(CASE WHEN ba1c.baseline_a1c >= 7.0 THEN ba1c.baseline_a1c - la1c.latest_a1c END), 2) as uncontrolled_diabetic_avg_improvement,
                 ROUND(AVG(DATEDIFF(la1c.latest_a1c_date, ba1c.baseline_a1c_date)), 0) as avg_days_between_readings
@@ -684,28 +658,17 @@ def create_demographic_weight_loss_analysis(cursor):
         )
     """, "Create demographic weight analysis table structure")
     
-    # Define demographic groups including age groups
+    # Define original demographic groups (restored from no_CorpsOps script)
     demographics = [
         ('Female', 'FEMALE', 'sex'),
         ('Male', 'MALE', 'sex'),
         ('Black/African American', 'BLACK_OR_AFRICAN_AMERICAN', 'ethnicity'),
         ('Hispanic/Latino', 'HISPANIC_LATINO', 'ethnicity'),
-        ('Asian', 'ASIAN', 'ethnicity'),
-        ('Age 18-39', '18_TO_39', 'age_range'),
-        ('Age 40+', '40_PLUS', 'age_range')
+        ('Asian', 'ASIAN', 'ethnicity')
     ]
     
     # Insert results for each demographic group
     for demo_name, demo_value, demo_field in demographics:
-        # Handle age groups with different WHERE clause
-        if demo_field == 'age_range':
-            if demo_value == '18_TO_39':
-                age_filter = "AND u.age >= 18 AND u.age < 40"
-            else:  # 40_PLUS
-                age_filter = "AND u.age >= 40"
-        else:
-            age_filter = f"AND u.{demo_field} = '{demo_value}'"
-        
         # All users in demographic
         demo_query = f"""
             INSERT INTO tmp_demographic_weight_analysis
@@ -724,7 +687,7 @@ def create_demographic_weight_loss_analysis(cursor):
             JOIN users u ON hos.user_id = u.id
             WHERE hos.baseline_weight_lbs IS NOT NULL 
             AND hos.latest_weight_lbs IS NOT NULL
-            {age_filter}
+            AND u.{demo_field} = '{demo_value}'
         """
         
         execute_with_timing(cursor, demo_query, f"Insert {demo_name} demographic analysis")
@@ -748,7 +711,7 @@ def create_demographic_weight_loss_analysis(cursor):
             WHERE hos.baseline_weight_lbs IS NOT NULL 
             AND hos.latest_weight_lbs IS NOT NULL
             AND hos.is_glp1_user = 1
-            {age_filter}
+            AND u.{demo_field} = '{demo_value}'
         """
         
         execute_with_timing(cursor, demo_glp1_query, f"Insert {demo_name} GLP1 demographic analysis")
@@ -778,28 +741,17 @@ def create_demographic_a1c_analysis(cursor):
         )
     """, "Create demographic A1C analysis table structure")
     
-    # Define demographic groups including age groups
+    # Define original demographic groups (restored from no_CorpsOps script)
     demographics = [
         ('Female', 'FEMALE', 'sex'),
         ('Male', 'MALE', 'sex'),
         ('Black/African American', 'BLACK_OR_AFRICAN_AMERICAN', 'ethnicity'),
         ('Hispanic/Latino', 'HISPANIC_LATINO', 'ethnicity'),
-        ('Asian', 'ASIAN', 'ethnicity'),
-        ('Age 18-39', '18_TO_39', 'age_range'),
-        ('Age 40+', '40_PLUS', 'age_range')
+        ('Asian', 'ASIAN', 'ethnicity')
     ]
     
     # Generate queries for all demographic groups
     for demo_name, demo_value, demo_field in demographics:
-        # Handle age groups with different WHERE clause
-        if demo_field == 'age_range':
-            if demo_value == '18_TO_39':
-                age_filter = "AND u.age >= 18 AND u.age < 40"
-            else:  # 40_PLUS
-                age_filter = "AND u.age >= 40"
-        else:
-            age_filter = f"AND u.{demo_field} = '{demo_value}'"
-        
         demo_a1c_query = f"""
             INSERT INTO tmp_demographic_a1c_analysis
             SELECT 
@@ -820,7 +772,7 @@ def create_demographic_a1c_analysis(cursor):
             JOIN users u ON hos.user_id = u.id
             WHERE hos.baseline_a1c IS NOT NULL 
             AND hos.latest_a1c IS NOT NULL
-            {age_filter}
+            AND u.{demo_field} = '{demo_value}'
         """
         
         execute_with_timing(cursor, demo_a1c_query, f"Insert {demo_name} demographic A1C analysis")
@@ -847,12 +799,12 @@ def create_demographic_a1c_analysis(cursor):
             WHERE hos.baseline_a1c IS NOT NULL 
             AND hos.latest_a1c IS NOT NULL
             AND hos.is_glp1_user = 1
-            {age_filter}
+            AND u.{demo_field} = '{demo_value}'
         """
         
         execute_with_timing(cursor, demo_glp1_a1c_query, f"Insert {demo_name} GLP1 demographic A1C analysis")
 
-def create_health_outcomes_summary_table(cursor, end_date='2026-01-01'):
+def create_health_outcomes_summary_table(cursor, end_date='2025-10-01'):
     """Create health outcomes summary using 6-month retention users with 30+ day requirements"""
     print(f"\n📊 Creating health outcomes summary table (30+ day requirements)...")
     
@@ -1128,7 +1080,7 @@ def export_weight_loss_user_lists(cursor, filename='weight_loss_user_lists.xlsx'
     
     print(f"    📊 Successfully exported user lists to: {filename}")
 
-def main_amazon_analysis(end_date='2026-01-01'):
+def main_amazon_analysis(end_date='2025-10-01'):
     """Main function to run Amazon QBR analysis"""
     print(f"🚀 Starting Amazon QBR Analysis (as of {end_date})")
     
@@ -1170,7 +1122,7 @@ def main_amazon_analysis(end_date='2026-01-01'):
                     'tmp_amazon_members_mapping',  # NEW
                     'tmp_health_outcomes_summary',  # ADD THIS LINE
                     'tmp_amazon_glp1_users_all', 'tmp_amazon_no_glp1_users_all',
-                    'tmp_baseline_weight_all', 'tmp_latest_weight_all', 'tmp_baseline_bmi_all',
+                    'tmp_baseline_weight_all', 'tmp_latest_weight_all',
                     'tmp_baseline_blood_pressure_all', 'tmp_latest_blood_pressure_all',
                     'tmp_baseline_a1c_all', 'tmp_latest_a1c_all',
                     'tmp_weight_loss_analysis', 'tmp_demographic_weight_analysis', 'tmp_bp_analysis',
